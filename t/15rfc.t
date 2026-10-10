@@ -7,6 +7,7 @@ for my $case (
     ['dual', 'IPv4/IPv6 outer and inner families, SSM and ASM'],
     ['teardown', 'NAT rebinding, limit flag, teardown credentials and direct relay'],
     ['fragments', 'IPv4/IPv6 reassembly, overlaps, expiry and atomic fragments'],
+    ['fragment-boundaries', 'fragment coverage boundaries, maximum sizes and slot reuse'],
     ['mld', 'MLDv2 truncation, checksums, router alert and query validation'],
     ['ecn', 'RFC 6040/9601 ECN matrix, checksum preservation and fragment marks'],
     ['raw', 'complete non-UDP multicast IP delivery'],

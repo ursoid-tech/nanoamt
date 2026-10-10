@@ -204,6 +204,70 @@ static void reassembly(void) {
   }
 }
 
+static void receive_fragment(nanoamt *g, const nanoamt_config *c, const uint8_t *whole, size_t offset, size_t length,
+                             int more, int expected, nanoamt_packet *packet) {
+  uint8_t p[1450];
+  CHECK(length <= 1400);
+  size_t n = fragment(p, whole, c->ip_version == 6, offset, length, more, 42);
+  CHECK(nanoamt_receive(g, 3, &c->discovery, p, n, packet) == expected);
+  if (expected == NANOAMT_IGNORED)
+    CHECK(packet->data == NULL && packet->size == 0);
+}
+
+static void reassembly_boundaries(void) {
+  for (int v6 = 0; v6 < 2; ++v6) {
+    unsigned random = 0;
+    nanoamt_config c = fixture_dual_config(&random, 0, v6, 0);
+    nanoamt_datagram request, report;
+    nanoamt_packet packet;
+    nanoamt *g = start(&c, &request, &report, 0);
+    uint8_t whole[65577];
+    size_t header = v6 ? 40 : 20;
+    const size_t lengths[] = {31, v6 ? 65535u : 65515u, 24, 25, 26, 27, 28, 29, 30, 31, 32};
+    for (size_t test = 0; test < sizeof(lengths) / sizeof(lengths[0]); ++test) {
+      size_t length = lengths[test], tail = (length - 1) / 8 * 8;
+      fixture_dual_data(whole, &c, 0, 0);
+      uint8_t *ip = whole + 2, *udp = ip + header;
+      put16(ip + (v6 ? 4 : 2), (unsigned)(v6 ? length : header + length));
+      ip[v6 ? 7 : 8] = (uint8_t)(test + 1);
+      if (!v6)
+        ip_checksum(ip);
+      put16(udp + 4, (unsigned)length);
+      for (size_t i = 8; i < length; ++i)
+        udp[i] = (uint8_t)(i + test);
+
+      receive_fragment(g, &c, whole, tail, length - tail, 0, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 0, 8, 1, NANOAMT_IGNORED, &packet);
+      for (size_t offset = 16; offset < tail;) {
+        size_t part = tail - offset;
+        if (part > 1400)
+          part = 1400;
+        receive_fragment(g, &c, whole, offset, part, 1, NANOAMT_IGNORED, &packet);
+        offset += part;
+      }
+      receive_fragment(g, &c, whole, 8, 8, 1, NANOAMT_PACKET, &packet);
+      CHECK(packet.ip_size == header + length && packet.size == length - 8);
+      CHECK(packet.ttl == test + 1 && !memcmp(packet.ip_data + header, udp, length));
+
+      if (length > 32)
+        continue;
+      receive_fragment(g, &c, whole, tail, length - tail, 0, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 8, length - 8, 0, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 0, 8, 1, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 8, length - 8, 0, NANOAMT_PACKET, &packet);
+      CHECK(packet.size == length - 8 && !memcmp(packet.data, udp + 8, packet.size));
+
+      receive_fragment(g, &c, whole, 8, 8, 1, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 0, 16, 1, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 16, length - 16, 0, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 0, 8, 1, NANOAMT_IGNORED, &packet);
+      receive_fragment(g, &c, whole, 8, 8, 1, NANOAMT_PACKET, &packet);
+      CHECK(packet.size == length - 8 && !memcmp(packet.data, udp + 8, packet.size));
+    }
+    nanoamt_free(g);
+  }
+}
+
 static void mld_validation(void) {
   unsigned random = 0;
   nanoamt_config c = fixture_dual_config(&random, 1, 1, 0);
@@ -314,6 +378,8 @@ int main(int argc, char **argv) {
     teardown();
   else if (!strcmp(argv[1], "fragments"))
     reassembly();
+  else if (!strcmp(argv[1], "fragment-boundaries"))
+    reassembly_boundaries();
   else if (!strcmp(argv[1], "mld"))
     mld_validation();
   else if (!strcmp(argv[1], "ecn"))

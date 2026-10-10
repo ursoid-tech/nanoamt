@@ -112,7 +112,8 @@ static assembly *get_assembly(nanoamt_reassembly *r, int64_t now, const fragment
   }
   if (!slot) {
     slot = oldest;
-    memset(slot, 0, sizeof(*slot));
+    memset(slot, 0, offsetof(assembly, prefix));
+    memset(slot->seen, 0, sizeof(slot->seen));
     slot->used = 1;
     slot->created = now;
     slot->version = f->version;
@@ -167,11 +168,16 @@ int nanoamt_reassemble(nanoamt_reassembly *r, int64_t now, uint8_t **bytes, size
   /* RFC 3168 */
   if ((slot->ecn_seen & 1) && slot->ecn_seen != 1)
     goto reject;
-  for (size_t i = f.offset; i < end; ++i)
-    if (slot->seen[i / 8] & (1u << (i % 8)))
+  size_t first_byte = f.offset / 8, last_byte = end / 8;
+  for (size_t i = first_byte; i < last_byte; ++i)
+    if (slot->seen[i])
       goto reject;
-  for (size_t i = f.offset; i < end; ++i)
-    slot->seen[i / 8] |= (uint8_t)(1u << (i % 8));
+  unsigned tail_mask = (1u << (end % 8)) - 1;
+  if (tail_mask && (slot->seen[last_byte] & tail_mask))
+    goto reject;
+  memset(slot->seen + first_byte, 255, last_byte - first_byte);
+  if (tail_mask)
+    slot->seen[last_byte] |= (uint8_t)tail_mask;
   memcpy(slot->body + f.offset, f.payload, f.length);
   slot->received += f.length;
   if (end > slot->highest)
