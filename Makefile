@@ -7,6 +7,7 @@ LDLIBS ?=
 WARNFLAGS ?= -Wall -Wextra -Wpedantic -Wconversion
 BUILD_DIR ?= build
 NANOAMT_BUILD_POSIX ?= 1
+NANOAMT_BUILD_AMTQ ?= 1
 SYSTEM ?= $(shell uname -s)
 PROVE ?= prove
 FUZZ_CC ?= clang
@@ -19,10 +20,17 @@ INSTALL ?= install
 CORE_SOURCES = lib/gateway.c lib/packet.c lib/igmp.c lib/reassembly.c
 CORE_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CORE_LIB = $(BUILD_DIR)/libnanoamt.a
+AMTQ_SOURCES = lib/amtq/wire.c lib/amtq/gateway.c lib/amtq/reassembly.c
+AMTQ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/%.o)
+AMTQ_LIB = $(BUILD_DIR)/libnanoamt-amtq.a
 POSIX_LIB = $(BUILD_DIR)/libnanoamt-posix.a
 TEST_DIR = $(BUILD_DIR)/t/00util
 TEST_BINS = $(TEST_DIR)/test-nanoamt $(TEST_DIR)/test-rfc
 TARGETS = $(CORE_LIB)
+ifeq ($(NANOAMT_BUILD_AMTQ),1)
+TARGETS += $(AMTQ_LIB)
+TEST_BINS += $(TEST_DIR)/test-amtq
+endif
 ifeq ($(NANOAMT_BUILD_POSIX),1)
 TARGETS += $(POSIX_LIB) $(BUILD_DIR)/nanoamt-recv
 TEST_BINS += $(TEST_DIR)/test-posix
@@ -32,10 +40,11 @@ endif
 endif
 FUZZ_FLAGS = -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
 FUZZ_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/receive.o
-OBJECTS = $(CORE_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/examples/recv.o \
-          $(addprefix $(TEST_DIR)/,test_gateway.o test_rfc.o test_posix.o test_kernel.o) $(FUZZ_OBJECTS)
+AMTQ_FUZZ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/amtq.o
+OBJECTS = $(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/examples/recv.o \
+          $(addprefix $(TEST_DIR)/,test_gateway.o test_rfc.o test_posix.o test_kernel.o test_amtq.o) $(FUZZ_OBJECTS) $(AMTQ_FUZZ_OBJECTS)
 
-.PHONY: all check sanitize fuzz install clean indent
+.PHONY: all check sanitize fuzz fuzz-amtq install clean indent
 .DELETE_ON_ERROR:
 all: $(TARGETS)
 
@@ -43,7 +52,7 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p "$(@D)"
 	$(CC) $(CPPFLAGS) -Iinclude $(CFLAGS) -std=c99 $(NANOAMT_WARNFLAGS) -MMD -MP -c $< -o $@
 
-$(CORE_OBJECTS) $(BUILD_DIR)/lib/posix.o: NANOAMT_WARNFLAGS = $(WARNFLAGS)
+$(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o: NANOAMT_WARNFLAGS = $(WARNFLAGS)
 
 $(CORE_LIB): $(CORE_OBJECTS)
 	rm -f $@
@@ -52,6 +61,13 @@ $(CORE_LIB): $(CORE_OBJECTS)
 $(POSIX_LIB): $(BUILD_DIR)/lib/posix.o
 	rm -f $@
 	$(AR) rcs $@ $^
+
+$(AMTQ_LIB): $(AMTQ_OBJECTS)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+$(TEST_DIR)/test-amtq: $(TEST_DIR)/test_amtq.o $(AMTQ_LIB) $(CORE_LIB)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/nanoamt-recv: $(BUILD_DIR)/examples/recv.o $(POSIX_LIB) $(CORE_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -66,7 +82,7 @@ $(TEST_DIR)/test-posix $(TEST_DIR)/test-kernel: $(TEST_DIR)/test-%: $(TEST_DIR)/
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 check: all $(TEST_BINS)
-	NANOAMT_BUILD_DIR="$(abspath $(BUILD_DIR))" NANOAMT_TEST_POSIX=$(NANOAMT_BUILD_POSIX) $(PROVE) -I. -v t/*.t
+	NANOAMT_BUILD_DIR="$(abspath $(BUILD_DIR))" NANOAMT_TEST_POSIX=$(NANOAMT_BUILD_POSIX) NANOAMT_TEST_AMTQ=$(NANOAMT_BUILD_AMTQ) $(PROVE) -I. -v t/*.t
 
 sanitize:
 	$(MAKE) BUILD_DIR="$(BUILD_DIR)-sanitize" \
@@ -82,13 +98,23 @@ $(BUILD_DIR)/fuzz-nanoamt: $(FUZZ_OBJECTS)
 
 fuzz: $(BUILD_DIR)/fuzz-nanoamt
 
+$(BUILD_DIR)/fuzz-amtq: $(AMTQ_FUZZ_OBJECTS) $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o)
+	$(FUZZ_CC) $(CFLAGS) $(LDFLAGS) $(FUZZ_FLAGS) -o $@ $^ $(LDLIBS)
+
+fuzz-amtq: $(BUILD_DIR)/fuzz-amtq
+
 indent:
-	clang-format -i include/*.h include/nanoamt/*.h lib/*.c lib/*.h examples/*.c fuzz/*.c t/00util/*.c t/00util/*.h
+	clang-format -i include/*.h include/nanoamt/*.h lib/*.c lib/*.h lib/amtq/*.c lib/amtq/*.h examples/*.c fuzz/*.c t/00util/*.c t/00util/*.h
 
 install: all
 	$(INSTALL) -d "$(DESTDIR)$(LIBDIR)" "$(DESTDIR)$(INCLUDEDIR)"
 	$(INSTALL) -m 644 $(CORE_LIB) "$(DESTDIR)$(LIBDIR)/libnanoamt.a"
 	$(INSTALL) -m 644 include/nanoamt.h "$(DESTDIR)$(INCLUDEDIR)/nanoamt.h"
+ifeq ($(NANOAMT_BUILD_AMTQ),1)
+	$(INSTALL) -d "$(DESTDIR)$(INCLUDEDIR)/nanoamt"
+	$(INSTALL) -m 644 $(AMTQ_LIB) "$(DESTDIR)$(LIBDIR)/libnanoamt-amtq.a"
+	$(INSTALL) -m 644 include/nanoamt/amtq.h "$(DESTDIR)$(INCLUDEDIR)/nanoamt/amtq.h"
+endif
 ifeq ($(NANOAMT_BUILD_POSIX),1)
 	$(INSTALL) -d "$(DESTDIR)$(INCLUDEDIR)/nanoamt"
 	$(INSTALL) -m 644 $(POSIX_LIB) "$(DESTDIR)$(LIBDIR)/libnanoamt-posix.a"
@@ -96,8 +122,8 @@ ifeq ($(NANOAMT_BUILD_POSIX),1)
 endif
 
 clean:
-	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(CORE_LIB) $(POSIX_LIB) \
-	    $(BUILD_DIR)/nanoamt-recv $(BUILD_DIR)/fuzz-nanoamt \
-	    $(addprefix $(TEST_DIR)/,test-nanoamt test-rfc test-posix test-kernel)
+	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(CORE_LIB) $(POSIX_LIB) $(AMTQ_LIB) \
+	    $(BUILD_DIR)/nanoamt-recv $(BUILD_DIR)/fuzz-nanoamt $(BUILD_DIR)/fuzz-amtq \
+	    $(addprefix $(TEST_DIR)/,test-nanoamt test-rfc test-posix test-kernel test-amtq)
 
 -include $(OBJECTS:.o=.d)
