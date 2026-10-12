@@ -32,6 +32,7 @@ struct nanoamt_relay_posix {
   queued_input *inputs;
   size_t control_head, control_count, input_head, input_count, input_bytes;
   nanoamt_relay_output pending;
+  nanoamt_relay_forward before_pending;
   uint8_t output[65577], input[65536];
   int64_t now, rate_at;
   uint64_t rate_credit;
@@ -448,6 +449,42 @@ static int relay_send_packet(nanoamt_relay_posix *io, const nanoamt_endpoint *so
   return 1;
 #endif
 }
+/* Consult the kernel's route cache after EMSGSIZE. A connected probe carries
+ * no application traffic and does not change the shared listener's peer. */
+static int relay_reduce_mtu(nanoamt_relay_posix *io, const nanoamt_relay_output *out) {
+#ifdef __linux__
+  int v6 = ip_version(out->destination.ip_version) == 6;
+  int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    return 0;
+  nanoamt_endpoint source = out->source;
+  source.port = 0;
+  struct sockaddr_storage local, peer;
+  socklen_t local_size = relay_sockaddr(&source, &local);
+  socklen_t peer_size = relay_sockaddr(&out->destination, &peer);
+  int mtu = 0;
+  socklen_t size = sizeof(mtu);
+  /* Binding an address alone can select a different route on a multihomed
+   * host. Match the packet-info interface used by relay_send_packet. These
+   * Linux options take the interface index in network byte order and do not
+   * require the privileges needed by SO_BINDTODEVICE. */
+  uint32_t ifindex = htonl(source.scope_id);
+  int rc = (source.scope_id && setsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_UNICAST_IF : IP_UNICAST_IF,
+                                          &ifindex, sizeof(ifindex))) ||
+           bind(fd, (struct sockaddr *)&local, local_size) || connect(fd, (struct sockaddr *)&peer, peer_size) ||
+           getsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_MTU : IP_MTU, &mtu, &size);
+  close(fd);
+  if (!rc && mtu > 0 && (size_t)mtu < out->size + (v6 ? 48u : 28u) &&
+      nanoamt_relay_set_path_mtu(io->relay, io->now, &out->destination, &out->source, (uint32_t)mtu) == NANOAMT_OK) {
+    ++io->stats.path_mtu_updates;
+    return 1;
+  }
+#else
+  (void)io;
+  (void)out;
+#endif
+  return 0;
+}
 static void relay_drop_input(nanoamt_relay_posix *io) {
   queued_input *work = &io->inputs[io->input_head];
   io->input_bytes -= work->size;
@@ -490,6 +527,7 @@ int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
       continue;
     }
     if (!io->pending.size) {
+      io->before_pending = work->cursor;
       rc = nanoamt_relay_forward_next(io->relay, now, &work->cursor, io->output, sizeof(io->output), &io->pending);
       if (rc == NANOAMT_OK) {
         relay_drop_input(io);
@@ -517,6 +555,12 @@ int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
         break;
       if (rc > 0)
         sent = 1;
+      else if (errno == EMSGSIZE && relay_reduce_mtu(io, &io->pending)) {
+        /* This datagram was not submitted. Reframe only this destination at
+         * the reduced budget, preserving completed fanout and input age. */
+        work->cursor = io->before_pending;
+        work->cursor.feedback_done = 0;
+      }
     }
     memset(&io->pending, 0, sizeof(io->pending));
   }

@@ -29,7 +29,7 @@ typedef struct nanoamt_relay_posix_config {
 } nanoamt_relay_posix_config;
 typedef struct nanoamt_relay_posix_stats {
   uint64_t received, truncated, rate_limited, control_dropped, input_dropped;
-  uint64_t sent, send_errors, expired, revoked, mtu_feedback;
+  uint64_t sent, send_errors, expired, revoked, mtu_feedback, path_mtu_updates;
   size_t queued_controls, queued_inputs, retained_input_bytes;
 } nanoamt_relay_posix_stats;
 
