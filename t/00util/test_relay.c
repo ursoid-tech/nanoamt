@@ -128,6 +128,62 @@ static void exchange(void) {
         nanoamt_relay_free(r);
       }
 }
+static void linux_gateway(void) {
+  for (unsigned family = 4; family <= 6; family += 2) {
+    unsigned random = 0;
+    nanoamt_relay_config c = {0};
+    c.random_bytes = fixture_random;
+    c.random_context = &random;
+    c.response_mac = test_mac;
+    c.linux_gateway_family = family;
+    c.query_source6[0] = 0xfe;
+    c.query_source6[1] = 0x80;
+    c.query_source6[15] = 1;
+    nanoamt_relay *r = nanoamt_relay_new(&c, 0);
+    CHECK(r);
+    nanoamt_config config = fixture_dual_config(&random, 0, family == 6, 0);
+    config.direct = 1;
+    nanoamt_endpoint peer = peer_for(&config, 40000);
+    nanoamt *g = nanoamt_new(&config, 0);
+    CHECK(g);
+    nanoamt_datagram request, report;
+    nanoamt_relay_control reply;
+    nanoamt_packet packet;
+    CHECK(nanoamt_send(g, 0, &request) == NANOAMT_PACKET);
+    request.bytes[1] = family == 6 ? 0x80 : 0;
+    CHECK(nanoamt_relay_receive(r, 0, &peer, &config.discovery, request.bytes, request.size, &reply) == NANOAMT_PACKET);
+    CHECK(!reply.bytes[1] && reply.size == (family == 6 ? 88u : 48u));
+    CHECK((reply.bytes[12] >> 4) == family);
+    if (family == 6)
+      CHECK(!memcmp(reply.bytes + 20, c.query_source6, 16));
+    CHECK(!nanoamt_receive(g, 0, &reply.source, reply.bytes, reply.size, &packet));
+    CHECK(nanoamt_send(g, 0, &report) == NANOAMT_PACKET);
+    CHECK(!nanoamt_relay_receive(r, 0, &peer, &config.discovery, report.bytes, report.size, &reply));
+    CHECK(nanoamt_is_joined(g));
+    request.bytes[1] ^= 0x80;
+    CHECK(nanoamt_relay_receive(r, 0, &peer, &config.discovery, request.bytes, request.size, &reply) ==
+          NANOAMT_IGNORED);
+    /* An authenticated cookie for one inner family never authorizes the other. */
+    nanoamt_relay *standard = new_relay(&random, 0);
+    nanoamt_config other = fixture_dual_config(&random, 0, family != 6, 0);
+    nanoamt_datagram other_report;
+    nanoamt *other_gateway = join(standard, &other, &peer, 0, &other_report);
+    memcpy(other_report.bytes + 2, report.bytes + 2, 10);
+    CHECK(nanoamt_relay_receive(r, 0, &peer, &config.discovery, other_report.bytes, other_report.size, &reply) ==
+          NANOAMT_IGNORED);
+    /* Compatibility is opt-in: a high Request bit remains reserved in RFC mode. */
+    request.bytes[1] = 0x80;
+    CHECK(nanoamt_relay_receive(standard, 0, &peer, &config.discovery, request.bytes, request.size, &reply) ==
+          NANOAMT_PACKET);
+    CHECK((reply.bytes[12] >> 4) == 4 && (reply.bytes[1] & 1u));
+    nanoamt_free(other_gateway);
+    nanoamt_relay_free(standard);
+    nanoamt_free(g);
+    nanoamt_relay_free(r);
+    c.linux_gateway_family = 5;
+    CHECK(!nanoamt_relay_new(&c, 0));
+  }
+}
 static void fanout(void) {
   unsigned random = 0;
   nanoamt_relay *r = new_relay(&random, 0);
@@ -631,6 +687,8 @@ int main(int argc, char **argv) {
   CHECK(argc == 2);
   if (!strcmp(argv[1], "exchange"))
     exchange();
+  else if (!strcmp(argv[1], "linux-gateway"))
+    linux_gateway();
   else if (!strcmp(argv[1], "fanout"))
     fanout();
   else if (!strcmp(argv[1], "authentication"))

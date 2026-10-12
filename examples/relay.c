@@ -27,6 +27,8 @@ static int64_t clock_ms(void) {
 static void usage(FILE *out) {
   fputs("usage: nanoamt-relay --interface NAME [--bind IP] [--port PORT]\n"
         "                     [--mtu BYTES] [--clients COUNT]\n"
+        "                     [--linux-gateway-family 4|6]\n"
+        "                     [--query-source4 IP] [--query-source6 IP]\n"
         "                     [--groups COUNT] [--sources COUNT]\n"
         "                     [--input-queue COUNT] [--input-bytes BYTES]\n"
         "                     [--control-queue COUNT] [--send-budget COUNT]\n"
@@ -82,7 +84,21 @@ int main(int argc, char **argv) {
       }
     } else if (!strcmp(option, "--port"))
       relay_config.listen.port = (uint16_t)number(value, 65535);
-    else if (!strcmp(option, "--mtu"))
+    else if (!strcmp(option, "--linux-gateway-family")) {
+      unsigned family = number(value, 6);
+      if (family != 4 && family != 6) {
+        fputs("Linux gateway compatibility requires inner family 4 or 6\n", stderr);
+        return 2;
+      }
+      relay_config.relay.linux_gateway_family = family;
+    } else if (!strcmp(option, "--query-source4") || !strcmp(option, "--query-source6")) {
+      int family = !strcmp(option, "--query-source4") ? AF_INET : AF_INET6;
+      uint8_t *address = family == AF_INET ? relay_config.relay.query_source4 : relay_config.relay.query_source6;
+      if (inet_pton(family, value, address) != 1) {
+        fprintf(stderr, "invalid query source: %s\n", value);
+        return 2;
+      }
+    } else if (!strcmp(option, "--mtu"))
       relay_config.relay.path_mtu = number(value, 65535);
     else if (!strcmp(option, "--clients"))
       relay_config.relay.max_clients = number(value, 1024);
