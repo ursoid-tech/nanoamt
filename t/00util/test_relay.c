@@ -430,6 +430,36 @@ static void expiry(void) {
   nanoamt_free(g);
   nanoamt_relay_free(r);
 }
+static void interface_refresh(void) {
+  for (int outer6 = 0; outer6 < 2; ++outer6) {
+    unsigned random = 0;
+    nanoamt_relay *r = new_relay(&random, 1);
+    nanoamt_config config = fixture_dual_config(&random, outer6, 0, 0);
+    nanoamt_endpoint peer = peer_for(&config, 40000);
+    config.discovery.scope_id = 7;
+    nanoamt_datagram report;
+    nanoamt *g = join(r, &config, &peer, 0, &report);
+    uint8_t ip[128], bytes[128];
+    size_t n = data(ip, &config, 5);
+    nanoamt_relay_forward cursor;
+    nanoamt_relay_output out;
+    CHECK(!nanoamt_relay_forward_begin(r, 0, ip, n, &cursor));
+    CHECK(nanoamt_relay_forward_next(r, 0, &cursor, bytes, sizeof(bytes), &out) == NANOAMT_PACKET);
+    CHECK(out.source.scope_id == 7 && nanoamt_relay_output_valid(r, 0, &out, bytes, out.size));
+    nanoamt_relay_control reply;
+    config.discovery.scope_id = 8;
+    CHECK(!nanoamt_relay_receive(r, 1, &peer, &config.discovery, report.bytes, report.size, &reply));
+    CHECK(!nanoamt_relay_output_valid(r, 1, &out, bytes, out.size));
+    nanoamt_relay_stats stats;
+    nanoamt_relay_get_stats(r, &stats);
+    CHECK(stats.clients == 1);
+    CHECK(!nanoamt_relay_forward_begin(r, 1, ip, n, &cursor));
+    CHECK(nanoamt_relay_forward_next(r, 1, &cursor, bytes, sizeof(bytes), &out) == NANOAMT_PACKET);
+    CHECK(out.source.scope_id == 8 && nanoamt_relay_output_valid(r, 1, &out, bytes, out.size));
+    nanoamt_free(g);
+    nanoamt_relay_free(r);
+  }
+}
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   if (!strcmp(argv[1], "exchange"))
@@ -446,6 +476,8 @@ int main(int argc, char **argv) {
     policy();
   else if (!strcmp(argv[1], "expiry"))
     expiry();
+  else if (!strcmp(argv[1], "interface-refresh"))
+    interface_refresh();
   else
     CHECK(0);
   printf("===AMT relay %s OK===\n", argv[1]);
