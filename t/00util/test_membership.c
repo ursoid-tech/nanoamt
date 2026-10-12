@@ -289,6 +289,20 @@ static void capacity(void) {
     }
     CHECK(!nanoamt_memberships_count(s));
     nanoamt_memberships_free(s);
+    if (mode == NANOAMT_MEMBERSHIP_ENDPOINT) {
+      s = nanoamt_memberships_new(&config, 0);
+      CHECK(s);
+      update(s, 4, 0, 1, 1);
+      /* A strict endpoint transaction admits new-before-old-withdrawal when
+       * the FINAL state fits, preserving the record order within a group. */
+      CHECK(!nanoamt_memberships_apply(s, 1, bytes, n, 4));
+      CHECK(nanoamt_memberships_count(s) == 1 && reception(s, 4) == 0);
+      nanoamt_membership_filter filter;
+      uint8_t sources[1][16];
+      CHECK(!nanoamt_memberships_get(s, 0, &filter, sources, 1));
+      CHECK(filter.group[3] == group4[3] + 1 && !memcmp(sources[0], sources4[1], 16));
+      nanoamt_memberships_free(s);
+    }
     s = nanoamt_memberships_new(&config, 0);
     CHECK(s);
     update(s, 4, 0, 1, 1);

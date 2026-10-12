@@ -21,7 +21,7 @@ INSTALL ?= install
 CORE_SOURCES = lib/gateway.c lib/packet.c lib/igmp.c lib/reassembly.c lib/membership.c lib/relay.c
 CORE_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 CORE_LIB = $(BUILD_DIR)/libnanoamt.a
-AMTQ_SOURCES = lib/amtq/wire.c lib/amtq/gateway.c lib/amtq/reassembly.c
+AMTQ_SOURCES = lib/amtq/wire.c lib/amtq/control.c lib/amtq/gateway.c lib/amtq/relay.c lib/amtq/reassembly.c
 AMTQ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/%.o)
 AMTQ_LIB = $(BUILD_DIR)/libnanoamt-amtq.a
 POSIX_LIB = $(BUILD_DIR)/libnanoamt-posix.a
@@ -35,7 +35,7 @@ TEST_BINS += $(TEST_DIR)/test-openssl
 endif
 ifeq ($(NANOAMT_BUILD_AMTQ),1)
 TARGETS += $(AMTQ_LIB)
-TEST_BINS += $(TEST_DIR)/test-amtq
+TEST_BINS += $(TEST_DIR)/test-amtq $(TEST_DIR)/test-amtq-relay
 endif
 ifeq ($(NANOAMT_BUILD_POSIX),1)
 TARGETS += $(POSIX_LIB) $(BUILD_DIR)/nanoamt-recv
@@ -47,11 +47,12 @@ endif
 FUZZ_FLAGS = -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
 FUZZ_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/receive.o
 AMTQ_FUZZ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/amtq.o
+AMTQ_RELAY_FUZZ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/amtq_relay.o
 RELAY_FUZZ_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/relay.o
 OBJECTS = $(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/lib/openssl.o $(BUILD_DIR)/examples/recv.o \
-          $(addprefix $(TEST_DIR)/,test_gateway.o test_rfc.o test_membership.o test_relay.o test_openssl.o test_posix.o test_kernel.o test_amtq.o) $(FUZZ_OBJECTS) $(AMTQ_FUZZ_OBJECTS) $(RELAY_FUZZ_OBJECTS)
+          $(addprefix $(TEST_DIR)/,test_gateway.o test_rfc.o test_membership.o test_relay.o test_openssl.o test_posix.o test_kernel.o test_amtq.o test_amtq_relay.o) $(FUZZ_OBJECTS) $(AMTQ_FUZZ_OBJECTS) $(AMTQ_RELAY_FUZZ_OBJECTS) $(RELAY_FUZZ_OBJECTS)
 
-.PHONY: all check sanitize fuzz fuzz-amtq fuzz-relay install clean indent
+.PHONY: all check sanitize fuzz fuzz-amtq fuzz-amtq-relay fuzz-relay install clean indent
 .DELETE_ON_ERROR:
 all: $(TARGETS)
 
@@ -78,6 +79,9 @@ $(AMTQ_LIB): $(AMTQ_OBJECTS)
 	$(AR) rcs $@ $^
 
 $(TEST_DIR)/test-amtq: $(TEST_DIR)/test_amtq.o $(AMTQ_LIB) $(CORE_LIB)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_DIR)/test-amtq-relay: $(TEST_DIR)/test_amtq_relay.o $(AMTQ_LIB) $(CORE_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(BUILD_DIR)/nanoamt-recv: $(BUILD_DIR)/examples/recv.o $(POSIX_LIB) $(CORE_LIB)
@@ -123,6 +127,11 @@ $(BUILD_DIR)/fuzz-amtq: $(AMTQ_FUZZ_OBJECTS) $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuz
 
 fuzz-amtq: $(BUILD_DIR)/fuzz-amtq
 
+$(BUILD_DIR)/fuzz-amtq-relay: $(AMTQ_RELAY_FUZZ_OBJECTS) $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o)
+	$(FUZZ_CC) $(CFLAGS) $(LDFLAGS) $(FUZZ_FLAGS) -o $@ $^ $(LDLIBS)
+
+fuzz-amtq-relay: $(BUILD_DIR)/fuzz-amtq-relay
+
 $(BUILD_DIR)/fuzz-relay: $(RELAY_FUZZ_OBJECTS)
 	$(FUZZ_CC) $(CFLAGS) $(LDFLAGS) $(FUZZ_FLAGS) -o $@ $^
 
@@ -146,6 +155,7 @@ ifeq ($(NANOAMT_BUILD_AMTQ),1)
 	$(INSTALL) -d "$(DESTDIR)$(INCLUDEDIR)/nanoamt"
 	$(INSTALL) -m 644 $(AMTQ_LIB) "$(DESTDIR)$(LIBDIR)/libnanoamt-amtq.a"
 	$(INSTALL) -m 644 include/nanoamt/amtq.h "$(DESTDIR)$(INCLUDEDIR)/nanoamt/amtq.h"
+	$(INSTALL) -m 644 include/nanoamt/amtq_relay.h "$(DESTDIR)$(INCLUDEDIR)/nanoamt/amtq_relay.h"
 endif
 ifeq ($(NANOAMT_BUILD_POSIX),1)
 	$(INSTALL) -d "$(DESTDIR)$(INCLUDEDIR)/nanoamt"
@@ -155,7 +165,7 @@ endif
 
 clean:
 	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(CORE_LIB) $(POSIX_LIB) $(AMTQ_LIB) $(OPENSSL_LIB) \
-    $(BUILD_DIR)/nanoamt-recv $(BUILD_DIR)/fuzz-nanoamt $(BUILD_DIR)/fuzz-amtq $(BUILD_DIR)/fuzz-relay \
-    $(addprefix $(TEST_DIR)/,test-nanoamt test-rfc test-membership test-relay test-openssl test-posix test-kernel test-amtq)
+    $(BUILD_DIR)/nanoamt-recv $(BUILD_DIR)/fuzz-nanoamt $(BUILD_DIR)/fuzz-amtq $(BUILD_DIR)/fuzz-amtq-relay $(BUILD_DIR)/fuzz-relay \
+    $(addprefix $(TEST_DIR)/,test-nanoamt test-rfc test-membership test-relay test-openssl test-posix test-kernel test-amtq test-amtq-relay)
 
 -include $(OBJECTS:.o=.d)
