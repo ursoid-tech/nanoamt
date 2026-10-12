@@ -1,16 +1,23 @@
 #include "nanoamt/amtq_relay.h"
 #include "internal.h"
 
-enum { CONTEXT_FREE, CONTEXT_OPENING, CONTEXT_PENDING, CONTEXT_ACTIVE, CONTEXT_CLOSING };
+enum { CONTEXT_FREE, CONTEXT_OPENING, CONTEXT_PENDING, CONTEXT_ACTIVE, CONTEXT_CLOSING, CONTEXT_RETIRED };
+typedef struct reliable_block {
+  uint64_t id;
+  int records;
+} reliable_block;
 typedef struct relay_context {
   uint64_t id, next_packet_id;
   int64_t deadline;
-  unsigned state;
+  unsigned state, mode;
+  uint64_t last_block;
+  reliable_block blocks[NANOAMTQ_MAX_RELIABLE_STREAMS];
 } relay_context;
 struct nanoamtq_relay {
   nanoamtq_relay_config config;
   nanoamt_memberships *requested, *authorized, *pending;
   uint64_t generation, revision, last_context, close_error;
+  unsigned peer_modes, preferred_mode;
   int error, local_settings, peer_settings, query_pending, awaiting_update, have_nonce, have_context;
   uint8_t ip_version, qqic, request_nonce[4], query_nonce[4];
   int64_t now, deadline, partial_deadline;
@@ -51,6 +58,10 @@ nanoamtq_relay *nanoamtq_relay_new(const nanoamtq_relay_config *config, int64_t 
       config->peer_max_uni_streams > AMTQ_VARINT_MAX)
     return NULL;
   nanoamtq_relay_config c = *config;
+  if (!c.data_modes)
+    c.data_modes = 1;
+  if (c.data_modes != 1 && c.data_modes != 3)
+    return NULL;
   if (!c.max_contexts)
     c.max_contexts = NANOAMTQ_MAX_CONTEXTS;
   if (!c.control_timeout_ms)
@@ -149,6 +160,9 @@ const nanoamt_memberships *nanoamtq_relay_authorized(const nanoamtq_relay *r) {
 }
 uint64_t nanoamtq_relay_generation(const nanoamtq_relay *r) {
   return r ? r->generation : 0;
+}
+uint64_t nanoamtq_relay_authorization_revision(const nanoamtq_relay *r) {
+  return r ? r->revision : 0;
 }
 int nanoamtq_relay_pending(const nanoamtq_relay *r) {
   return r && r->pending && !r->error;
@@ -293,6 +307,8 @@ static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
       return fail(r, rc, NANOAMTQ_CLOSE_INTERNAL);
     if (rc || ((modes & 2u) && !r->config.peer_max_uni_streams))
       return protocol(r, NANOAMTQ_CLOSE_SETTINGS);
+    r->peer_modes = (unsigned)(modes & 3);
+    r->preferred_mode = preferred == 1 && (modes & r->config.data_modes & 2) ? 1 : 0;
     r->peer_settings = 1;
     if (r->local_settings)
       r->deadline = INT64_MAX;
@@ -393,7 +409,7 @@ int nanoamtq_relay_send(nanoamtq_relay *r, int64_t now, nanoamtq_control *out) {
   if (rc)
     return rc;
   if (!r->local_settings) {
-    const uint8_t settings[] = {0, 1};
+    const uint8_t settings[] = {0, (uint8_t)r->config.data_modes};
     rc = emit(r, out, NANOAMTQ_SETTINGS, settings, sizeof(settings));
     if (rc == NANOAMTQ_PACKET) {
       r->local_settings = 1;
@@ -423,11 +439,17 @@ int nanoamtq_relay_send(nanoamtq_relay *r, int64_t now, nanoamtq_control *out) {
   for (unsigned i = 0; i < r->config.max_contexts; ++i) {
     relay_context *c = r->contexts + i;
     if (c->state == CONTEXT_CLOSING) {
-      uint8_t id[8];
+      uint8_t id[16];
       size_t n = amtq_put(id, c->id);
+      if (c->mode == NANOAMTQ_MODE_RELIABLE)
+        n += amtq_put(id + n, c->last_block);
       rc = emit(r, out, NANOAMTQ_CONTEXT_CLOSE, id, n);
-      if (rc == NANOAMTQ_PACKET)
-        memset(c, 0, sizeof(*c));
+      if (rc == NANOAMTQ_PACKET) {
+        if (c->mode == NANOAMTQ_MODE_RELIABLE)
+          c->state = CONTEXT_RETIRED;
+        else
+          memset(c, 0, sizeof(*c));
+      }
       return rc;
     }
     if (c->state == CONTEXT_OPENING && (!opening || c->id < opening->id))
@@ -436,7 +458,7 @@ int nanoamtq_relay_send(nanoamtq_relay *r, int64_t now, nanoamtq_control *out) {
   if (opening) {
     uint8_t fields[9];
     size_t n = amtq_put(fields, opening->id);
-    fields[n++] = 0; /* Datagram Mode. */
+    fields[n++] = (uint8_t)opening->mode;
     rc = emit(r, out, NANOAMTQ_CONTEXT, fields, n);
     if (rc == NANOAMTQ_PACKET) {
       opening->state = CONTEXT_PENDING;
@@ -446,8 +468,18 @@ int nanoamtq_relay_send(nanoamtq_relay *r, int64_t now, nanoamtq_control *out) {
   }
   return NANOAMTQ_OK;
 }
+int nanoamtq_relay_preferred_mode(const nanoamtq_relay *r) {
+  return r && r->peer_settings ? (int)r->preferred_mode : -1;
+}
+int nanoamtq_relay_context_mode(const nanoamtq_relay *r, uint64_t id) {
+  relay_context *c = r ? find_context(r, id) : NULL;
+  return c ? (int)c->mode : -1;
+}
 int nanoamtq_relay_open_context(nanoamtq_relay *r, int64_t now, uint64_t id) {
-  if (!r || id > AMTQ_VARINT_MAX)
+  return nanoamtq_relay_open_context_mode(r, now, id, NANOAMTQ_MODE_DATAGRAM);
+}
+int nanoamtq_relay_open_context_mode(nanoamtq_relay *r, int64_t now, uint64_t id, unsigned mode) {
+  if (!r || id > AMTQ_VARINT_MAX || mode > 1 || !(r->config.data_modes & r->peer_modes & (1u << mode)))
     return NANOAMTQ_ERROR_ARGUMENT;
   int rc = nanoamtq_relay_tick(r, now);
   if (rc)
@@ -456,7 +488,8 @@ int nanoamtq_relay_open_context(nanoamtq_relay *r, int64_t now, uint64_t id) {
     return NANOAMTQ_ERROR_ARGUMENT;
   for (unsigned i = 0; i < r->config.max_contexts; ++i)
     if (!r->contexts[i].state) {
-      r->contexts[i] = (relay_context){id, 1, INT64_MAX, CONTEXT_OPENING};
+      r->contexts[i] =
+          (relay_context){.id = id, .next_packet_id = 1, .deadline = INT64_MAX, .state = CONTEXT_OPENING, .mode = mode};
       r->last_context = id;
       r->have_context = 1;
       return NANOAMTQ_OK;
@@ -470,6 +503,9 @@ int nanoamtq_relay_close_context(nanoamtq_relay *r, int64_t now, uint64_t id) {
   relay_context *c = find_context(r, id);
   if (!c || c->state != CONTEXT_ACTIVE)
     return NANOAMTQ_ERROR_ARGUMENT;
+  for (unsigned i = 0; i < NANOAMTQ_MAX_RELIABLE_STREAMS; ++i)
+    if (c->blocks[i].id)
+      return NANOAMTQ_ERROR_LIMIT;
   c->state = CONTEXT_CLOSING;
   return NANOAMTQ_OK;
 }
@@ -492,7 +528,7 @@ int nanoamtq_relay_datagram_begin(nanoamtq_relay *r, int64_t now, uint64_t id, c
   if (rc)
     return rc;
   relay_context *c = find_context(r, id);
-  if (!c)
+  if (!c || c->mode != NANOAMTQ_MODE_DATAGRAM)
     return NANOAMTQ_ERROR_ARGUMENT;
   ip_packet ip;
   if (c->state != CONTEXT_ACTIVE || n > NANOAMTQ_MAX_DATA_MESSAGE - 2 || !nanoamt_ip_forward_decode(p, n, &ip) ||
@@ -527,8 +563,8 @@ int nanoamtq_relay_datagram_next(nanoamtq_relay *r, int64_t now, nanoamtq_relay_
     return NANOAMTQ_OK;
   ip_packet ip;
   relay_context *c = find_context(r, f->context_id);
-  if (!c || c->state != CONTEXT_ACTIVE || !nanoamt_ip_forward_decode(f->ip, f->size, &ip) ||
-      !data_allowed(r, ip.version, ip.source, ip.destination)) {
+  if (!c || c->mode != NANOAMTQ_MODE_DATAGRAM || c->state != CONTEXT_ACTIVE ||
+      !nanoamt_ip_forward_decode(f->ip, f->size, &ip) || !data_allowed(r, ip.version, ip.source, ip.destination)) {
     f->offset = total;
     return NANOAMTQ_IGNORED;
   }
@@ -583,8 +619,9 @@ int nanoamtq_relay_datagram_valid(nanoamtq_relay *r, int64_t now, const nanoamtq
     return 0;
   relay_context *c = find_context(r, out->context_id);
   nanoamtq_datagram d;
-  if (!c || c->state != CONTEXT_ACTIVE || !data_allowed(r, out->ip_version, out->source, out->group) ||
-      nanoamtq_datagram_decode(bytes, size, &d) || d.context_id != out->context_id || d.format != out->format)
+  if (!c || c->mode != NANOAMTQ_MODE_DATAGRAM || c->state != CONTEXT_ACTIVE ||
+      !data_allowed(r, out->ip_version, out->source, out->group) || nanoamtq_datagram_decode(bytes, size, &d) ||
+      d.context_id != out->context_id || d.format != out->format)
     return 0;
   if (d.format == NANOAMTQ_COMPLETE) {
     ip_packet ip;
@@ -596,4 +633,122 @@ int nanoamtq_relay_datagram_valid(nanoamtq_relay *r, int64_t now, const nanoamtq
   }
   return d.format == NANOAMTQ_FRAGMENT && d.packet_id == out->packet_id && d.offset == out->offset &&
          d.total_size == out->total_size;
+}
+
+static reliable_block *find_block(relay_context *c, uint64_t id) {
+  if (c && id)
+    for (unsigned i = 0; i < NANOAMTQ_MAX_RELIABLE_STREAMS; ++i)
+      if (c->blocks[i].id == id)
+        return c->blocks + i;
+  return NULL;
+}
+int nanoamtq_relay_reliable_begin(nanoamtq_relay *r, int64_t now, uint64_t id, uint64_t *block, uint8_t *bytes,
+                                  size_t capacity, size_t *size) {
+  if (!block || !size || (!bytes && capacity))
+    return NANOAMTQ_ERROR_ARGUMENT;
+  *block = 0;
+  *size = 0;
+  int rc = nanoamtq_relay_tick(r, now);
+  if (rc)
+    return rc;
+  relay_context *c = find_context(r, id);
+  if (!c || c->state != CONTEXT_ACTIVE || c->mode != NANOAMTQ_MODE_RELIABLE)
+    return NANOAMTQ_ERROR_ARGUMENT;
+  if (c->last_block == AMTQ_VARINT_MAX)
+    return protocol(r, NANOAMTQ_CLOSE_CONTEXT);
+  *size = 1 + amtq_varint_size(id) + amtq_varint_size(c->last_block + 1);
+  if (capacity < *size)
+    return NANOAMTQ_ERROR_BUFFER;
+  for (unsigned i = 0; i < NANOAMTQ_MAX_RELIABLE_STREAMS; ++i) {
+    if (c->blocks[i].id)
+      continue;
+    *block = ++c->last_block;
+    c->blocks[i] = (reliable_block){*block, 0};
+    bytes[0] = 0;
+    size_t at = 1 + amtq_put(bytes + 1, id);
+    amtq_put(bytes + at, *block);
+    return NANOAMTQ_PACKET;
+  }
+  return NANOAMTQ_ERROR_LIMIT;
+}
+int nanoamtq_relay_reliable_record(nanoamtq_relay *r, int64_t now, uint64_t id, uint64_t block, const uint8_t *ip_bytes,
+                                   size_t n, uint8_t *bytes, size_t capacity, nanoamtq_relay_datagram_output *out) {
+  if (!out || (!ip_bytes && n) || (!bytes && capacity))
+    return NANOAMTQ_ERROR_ARGUMENT;
+  memset(out, 0, sizeof(*out));
+  int rc = nanoamtq_relay_tick(r, now);
+  if (rc)
+    return rc;
+  relay_context *c = find_context(r, id);
+  reliable_block *b = find_block(c, block);
+  if (!b || c->state != CONTEXT_ACTIVE || c->mode != NANOAMTQ_MODE_RELIABLE)
+    return NANOAMTQ_ERROR_ARGUMENT;
+  ip_packet ip;
+  if (n > NANOAMTQ_MAX_DATA_MESSAGE - 2 || !nanoamt_ip_forward_decode(ip_bytes, n, &ip) || ip.size != n ||
+      !forwardable(&ip) || !data_allowed(r, ip.version, ip.source, ip.destination))
+    return NANOAMTQ_IGNORED;
+  out->size = amtq_varint_size(n + 2) + n + 2;
+  if (capacity < out->size)
+    return NANOAMTQ_ERROR_BUFFER;
+  size_t at = amtq_put(bytes, n + 2);
+  copy_message(bytes + at, ip_bytes, 0, n + 2);
+  out->connection_id = r->config.connection_id;
+  out->context_id = id;
+  out->packet_id = block;
+  out->total_size = n + 2;
+  out->format = NANOAMTQ_RELIABLE_RECORD;
+  out->ip_version = ip.version;
+  memcpy(out->source, ip.source, ip_address_size(ip.version));
+  memcpy(out->group, ip.destination, ip_address_size(ip.version));
+  b->records = 1;
+  return NANOAMTQ_PACKET;
+}
+int nanoamtq_relay_reliable_valid(nanoamtq_relay *r, int64_t now, const nanoamtq_relay_datagram_output *out,
+                                  const uint8_t *bytes, size_t size) {
+  if (!r || !out || !bytes || out->connection_id != r->config.connection_id || out->size != size ||
+      out->format != NANOAMTQ_RELIABLE_RECORD || nanoamtq_relay_tick(r, now))
+    return 0;
+  relay_context *c = find_context(r, out->context_id);
+  size_t at = 0;
+  uint64_t n;
+  ip_packet ip;
+  return c && (c->state == CONTEXT_ACTIVE || c->state == CONTEXT_CLOSING || c->state == CONTEXT_RETIRED) &&
+         c->mode == NANOAMTQ_MODE_RELIABLE && out->packet_id && out->packet_id <= c->last_block &&
+         data_allowed(r, out->ip_version, out->source, out->group) && amtq_get(bytes, size, &at, &n) &&
+         n == size - at && n == out->total_size && n >= 3 && bytes[at] == MULTICAST_DATA && !bytes[at + 1] &&
+         nanoamt_ip_forward_decode(bytes + at + 2, size - at - 2, &ip) && ip.size == size - at - 2 &&
+         ip.version == out->ip_version && forwardable(&ip) &&
+         !memcmp(ip.source, out->source, ip_address_size(ip.version)) &&
+         !memcmp(ip.destination, out->group, ip_address_size(ip.version));
+}
+int nanoamtq_relay_reliable_finish(nanoamtq_relay *r, int64_t now, uint64_t id, uint64_t block) {
+  int rc = nanoamtq_relay_tick(r, now);
+  if (rc)
+    return rc;
+  reliable_block *b = find_block(find_context(r, id), block);
+  if (!b || !b->records)
+    return NANOAMTQ_ERROR_ARGUMENT;
+  memset(b, 0, sizeof(*b));
+  return NANOAMTQ_OK;
+}
+int nanoamtq_relay_reliable_abort(nanoamtq_relay *r, int64_t now, uint64_t id, uint64_t block) {
+  int rc = nanoamtq_relay_tick(r, now);
+  if (rc)
+    return rc;
+  relay_context *c = find_context(r, id);
+  /* FIN acceptance does not immunize a live QUIC stream against STOP_SENDING. */
+  if (!c || c->mode != NANOAMTQ_MODE_RELIABLE || !block || block > c->last_block)
+    return NANOAMTQ_ERROR_ARGUMENT;
+  return protocol(r, NANOAMTQ_CLOSE_CONTEXT);
+}
+
+int nanoamtq_relay_release_context(nanoamtq_relay *r, int64_t now, uint64_t id) {
+  int rc = nanoamtq_relay_tick(r, now);
+  if (rc)
+    return rc;
+  relay_context *c = find_context(r, id);
+  if (!c || c->state != CONTEXT_RETIRED)
+    return NANOAMTQ_ERROR_ARGUMENT;
+  memset(c, 0, sizeof(*c));
+  return NANOAMTQ_OK;
 }

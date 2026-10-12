@@ -1,8 +1,29 @@
 #include "internal.h"
 
+typedef struct id_range {
+  uint64_t first, last;
+} id_range;
+typedef struct id_ranges {
+  unsigned count;
+  id_range values[NANOAMTQ_MAX_BLOCK_RANGES];
+} id_ranges;
+typedef struct reliable_state {
+  id_ranges seen, completed;
+} reliable_state;
+typedef struct reliable_stream {
+  uint64_t id, context_id, block_id;
+  unsigned stage; /* 0 free, 1 type, 2 context, 3 block, 4 length, 5 body, 6 unknown */
+  uint8_t varint[8], *body;
+  size_t varint_size, size, target;
+  int records;
+} reliable_stream;
 typedef struct context {
   uint64_t id;
-  int used, acknowledged;
+  int used, acknowledged, closing;
+  unsigned mode;
+  uint64_t final_block;
+  int64_t drain_deadline;
+  reliable_state *reliable;
 } context;
 
 struct nanoamtq {
@@ -13,6 +34,8 @@ struct nanoamtq {
   uint8_t nonce[4];
   int64_t now, control_deadline, refresh_at;
   uint64_t last_context;
+  unsigned peer_modes;
+  reliable_stream streams[NANOAMTQ_MAX_RELIABLE_STREAMS];
   context contexts[NANOAMTQ_MAX_CONTEXTS];
   nanoamtq_membership desired[NANOAMTQ_MAX_MEMBERSHIPS], sent[NANOAMTQ_MAX_MEMBERSHIPS];
   size_t desired_count, sent_count;
@@ -30,6 +53,10 @@ static int fail(nanoamtq *g, int error, uint64_t code) {
 static int protocol(nanoamtq *g, uint64_t code) {
   return fail(g, NANOAMTQ_ERROR_PROTOCOL, code);
 }
+static void clear_context(context *c) {
+  free(c->reliable);
+  memset(c, 0, sizeof(*c));
+}
 static int advance(nanoamtq *g, int64_t now) {
   if (!g || now < 0 || now < g->now || now == INT64_MAX)
     return NANOAMTQ_ERROR_ARGUMENT;
@@ -37,6 +64,9 @@ static int advance(nanoamtq *g, int64_t now) {
     return g->error;
   g->now = now;
   amtq_frag_expire(&g->fragments, now);
+  for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
+    if (g->contexts[i].used && g->contexts[i].closing && now >= g->contexts[i].drain_deadline)
+      return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
   if (now >= g->control_deadline)
     return fail(g, NANOAMTQ_ERROR_TIMEOUT, 0);
   return NANOAMTQ_OK;
@@ -51,12 +81,18 @@ static int forwardable(const uint8_t *group, unsigned version) {
 nanoamtq *nanoamtq_new(const nanoamtq_config *config, int64_t now) {
   if (!config || !config->random_bytes || now < 0 || now == INT64_MAX ||
       (config->ip_version && config->ip_version != 4 && config->ip_version != 6) || config->max_incomplete > 64 ||
-      config->max_fragment_ranges > AMTQ_MAX_RANGES)
+      config->max_fragment_ranges > AMTQ_MAX_RANGES || config->max_reliable_streams > NANOAMTQ_MAX_RELIABLE_STREAMS ||
+      (config->data_modes && config->data_modes != 1 && config->data_modes != 3) || config->preferred_mode > 1 ||
+      (config->preferred_mode == 1 && config->data_modes != 3))
     return NULL;
   nanoamtq *g = calloc(1, sizeof(*g));
   if (!g)
     return NULL;
   g->config = *config;
+  if (!g->config.data_modes)
+    g->config.data_modes = 1;
+  if (!g->config.max_reliable_streams)
+    g->config.max_reliable_streams = NANOAMTQ_MAX_RELIABLE_STREAMS;
   g->config.ip_version = (uint8_t)ip_version(config->ip_version);
   if (!g->config.control_timeout_ms)
     g->config.control_timeout_ms = 10000;
@@ -82,6 +118,10 @@ void nanoamtq_free(nanoamtq *g) {
   if (g->fragments.slots)
     for (unsigned i = 0; i < g->fragments.capacity; ++i)
       amtq_frag_clear(&g->fragments.slots[i]);
+  for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
+    clear_context(g->contexts + i);
+  for (unsigned i = 0; i < NANOAMTQ_MAX_RELIABLE_STREAMS; ++i)
+    free(g->streams[i].body);
   free(g->fragments.slots);
   nanoamt_reassembly_destroy(g->ip_fragments);
   free(g);
@@ -183,8 +223,8 @@ int nanoamtq_send(nanoamtq *g, int64_t now, nanoamtq_control *out) {
   if (rc)
     return rc;
   if (!g->local_settings) {
-    const uint8_t settings[] = {0, 1};
-    rc = emit(g, out, NANOAMTQ_SETTINGS, settings, sizeof(settings));
+    const uint8_t settings[] = {0, (uint8_t)g->config.data_modes, 1, (uint8_t)g->config.preferred_mode};
+    rc = emit(g, out, NANOAMTQ_SETTINGS, settings, g->config.preferred_mode ? 4 : 2);
     if (rc == NANOAMTQ_PACKET) {
       g->local_settings = 1;
       if (g->peer_settings)
@@ -243,6 +283,7 @@ static int settings(nanoamtq *g, const uint8_t *p, size_t n) {
     return protocol(g, NANOAMTQ_CLOSE_INTERNAL);
   if (rc)
     return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
+  g->peer_modes = (unsigned)(modes & 3);
   g->peer_settings = 1;
   if (g->local_settings)
     g->control_deadline = INT64_MAX;
@@ -253,6 +294,44 @@ static context *find_context(nanoamtq *g, uint64_t id) {
     if (g->contexts[i].used && g->contexts[i].id == id)
       return &g->contexts[i];
   return NULL;
+}
+/* Sorted merged intervals bound sparse/reordered identifiers without growing
+ * memory for a long-lived contiguous stream of completed blocks. */
+static int range_insert(id_ranges *r, uint64_t id) {
+  unsigned i = 0;
+  while (i < r->count && r->values[i].last < id)
+    ++i;
+  if (i < r->count && r->values[i].first <= id)
+    return 0;
+  int left = i && r->values[i - 1].last + 1 == id;
+  int right = i < r->count && id + 1 == r->values[i].first;
+  if (left) {
+    r->values[i - 1].last = right ? r->values[i].last : id;
+    if (right) {
+      memmove(r->values + i, r->values + i + 1, (r->count - i - 1) * sizeof(*r->values));
+      --r->count;
+    }
+  } else if (right)
+    r->values[i].first = id;
+  else {
+    if (r->count == NANOAMTQ_MAX_BLOCK_RANGES)
+      return -1;
+    memmove(r->values + i + 1, r->values + i, (r->count - i) * sizeof(*r->values));
+    r->values[i] = (id_range){id, id};
+    ++r->count;
+  }
+  return 1;
+}
+static int drain_complete(const context *c) {
+  const id_ranges *r = &c->reliable->completed;
+  return !c->final_block || (r->count && r->values[0].first == 1 && r->values[0].last == c->final_block);
+}
+int nanoamtq_context_mode(const nanoamtq *g, uint64_t id) {
+  if (g)
+    for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
+      if (g->contexts[i].used && g->contexts[i].id == id)
+        return (int)g->contexts[i].mode;
+  return -1;
 }
 static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
   if (type == NANOAMTQ_SETTINGS)
@@ -286,19 +365,37 @@ static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
     return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
   if (type == NANOAMTQ_CONTEXT_CLOSE) {
     context *c = find_context(g, id);
-    if (!c || at != n)
+    if (!c || c->closing)
       return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
-    memset(c, 0, sizeof(*c));
-    amtq_frag_discard(&g->fragments, id);
+    if (c->mode == NANOAMTQ_MODE_RELIABLE) {
+      uint64_t final;
+      if (!amtq_get(p, n, &at, &final) || at != n ||
+          (c->reliable->seen.count && c->reliable->seen.values[c->reliable->seen.count - 1].last > final))
+        return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
+      c->closing = 1;
+      c->final_block = final;
+      c->drain_deadline = amtq_after(g->now, g->config.control_timeout_ms);
+      if (drain_complete(c))
+        clear_context(c);
+    } else {
+      if (at != n)
+        return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
+      clear_context(c);
+      amtq_frag_discard(&g->fragments, id);
+    }
     return NANOAMTQ_OK;
   }
   if (!amtq_get(p, n, &at, &mode) || at != n)
     return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
-  if (mode != 0 || (!g->have_context && id != 0) || (g->have_context && id <= g->last_context))
+  if (mode > 1 || !(g->config.data_modes & g->peer_modes & (1u << mode)) || (!g->have_context && id != 0) ||
+      (g->have_context && id <= g->last_context))
     return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
   for (size_t i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
     if (!g->contexts[i].used) {
-      g->contexts[i] = (context){id, 1, 0};
+      reliable_state *r = mode == NANOAMTQ_MODE_RELIABLE ? calloc(1, sizeof(*r)) : NULL;
+      if (mode == NANOAMTQ_MODE_RELIABLE && !r)
+        return fail(g, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+      g->contexts[i] = (context){.id = id, .used = 1, .mode = (unsigned)mode, .reliable = r};
       g->last_context = id;
       g->have_context = 1;
       return NANOAMTQ_OK;
@@ -330,30 +427,7 @@ static int requested(nanoamtq *g, const ip_packet *ip) {
       return 1;
   return 0;
 }
-int nanoamtq_receive_datagram(nanoamtq *g, int64_t now, const uint8_t *p, size_t n, nanoamt_packet *packet) {
-  if (packet)
-    memset(packet, 0, sizeof(*packet));
-  if (!packet || (!p && n))
-    return NANOAMTQ_ERROR_ARGUMENT;
-  int rc = advance(g, now);
-  if (rc)
-    return rc;
-  nanoamtq_datagram d;
-  if (nanoamtq_datagram_decode(p, n, &d))
-    return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
-  if (d.format != NANOAMTQ_COMPLETE && d.format != NANOAMTQ_FRAGMENT)
-    return NANOAMTQ_IGNORED;
-  context *c = find_context(g, d.context_id);
-  if (!c || !c->acknowledged || !g->reported)
-    return NANOAMTQ_IGNORED;
-  size_t size = d.size;
-  if (d.format == NANOAMTQ_FRAGMENT) {
-    rc = amtq_frag_push(&g->fragments, now, &d, g->message);
-    if (rc != NANOAMTQ_PACKET)
-      return rc;
-    size = d.total_size;
-  } else
-    memmove(g->message, d.data, d.size);
+static int deliver(nanoamtq *g, int64_t now, size_t size, nanoamt_packet *packet) {
   if (size < 3 || g->message[0] != 6 || g->message[1] != 0)
     return NANOAMTQ_IGNORED;
   uint8_t *ip_bytes = g->message + 2;
@@ -378,12 +452,44 @@ int nanoamtq_receive_datagram(nanoamtq *g, int64_t now, const uint8_t *p, size_t
   }
   return NANOAMTQ_IGNORED;
 }
+int nanoamtq_receive_datagram(nanoamtq *g, int64_t now, const uint8_t *p, size_t n, nanoamt_packet *packet) {
+  if (packet)
+    memset(packet, 0, sizeof(*packet));
+  if (!packet || (!p && n))
+    return NANOAMTQ_ERROR_ARGUMENT;
+  int rc = advance(g, now);
+  if (rc)
+    return rc;
+  nanoamtq_datagram d;
+  if (nanoamtq_datagram_decode(p, n, &d))
+    return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
+  if (d.format != NANOAMTQ_COMPLETE && d.format != NANOAMTQ_FRAGMENT)
+    return NANOAMTQ_IGNORED;
+  context *c = find_context(g, d.context_id);
+  if (c && c->mode != NANOAMTQ_MODE_DATAGRAM)
+    return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
+  if (!c || !c->acknowledged || !g->reported)
+    return NANOAMTQ_IGNORED;
+  size_t size = d.size;
+  if (d.format == NANOAMTQ_FRAGMENT) {
+    rc = amtq_frag_push(&g->fragments, now, &d, g->message);
+    if (rc != NANOAMTQ_PACKET)
+      return rc;
+    size = d.total_size;
+  } else
+    memmove(g->message, d.data, d.size);
+  return deliver(g, now, size, packet);
+}
+
 int64_t nanoamtq_next_timeout(const nanoamtq *g) {
   if (!g || g->error)
     return INT64_MAX;
   if (!g->local_settings)
     return g->now;
   int64_t next = g->control_deadline;
+  for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
+    if (g->contexts[i].used && g->contexts[i].closing && g->contexts[i].drain_deadline < next)
+      next = g->contexts[i].drain_deadline;
   if (g->peer_settings) {
     for (size_t i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
       if (g->contexts[i].used && !g->contexts[i].acknowledged)
@@ -398,6 +504,9 @@ int64_t nanoamtq_next_timeout(const nanoamtq *g) {
   int64_t fragments = amtq_frag_deadline(&g->fragments);
   return fragments < next ? fragments : next;
 }
+int nanoamtq_memberships_submitted(const nanoamtq *g) {
+  return g && !g->error && g->reported && !g->dirty;
+}
 int nanoamtq_is_ready(const nanoamtq *g) {
   if (!g || g->error || !g->reported)
     return 0;
@@ -411,4 +520,116 @@ int nanoamtq_error(const nanoamtq *g) {
 }
 uint64_t nanoamtq_close_error(const nanoamtq *g) {
   return g ? g->close_error : 0;
+}
+
+static int stream_end(nanoamtq *g, reliable_stream *s, int event) {
+  if (s->stage != 6) {
+    if (event != NANOAMTQ_STREAM_FIN || s->stage != 4 || s->varint_size || !s->records)
+      return protocol(g, event == NANOAMTQ_STREAM_RESET ? NANOAMTQ_CLOSE_CONTEXT : NANOAMTQ_CLOSE_PROTOCOL);
+    context *c = find_context(g, s->context_id);
+    if (!c || !c->reliable)
+      return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
+    int rc = range_insert(&c->reliable->completed, s->block_id);
+    if (rc <= 0)
+      return protocol(g, rc < 0 ? NANOAMTQ_CLOSE_EXCESSIVE_LOAD : NANOAMTQ_CLOSE_CONTEXT);
+    if (c->closing && drain_complete(c))
+      clear_context(c);
+  }
+  free(s->body);
+  memset(s, 0, sizeof(*s));
+  return NANOAMTQ_OK;
+}
+int nanoamtq_receive_stream(nanoamtq *g, int64_t now, uint64_t id, const uint8_t *p, size_t n, int event,
+                            size_t *consumed, nanoamt_packet *packet) {
+  if (packet)
+    memset(packet, 0, sizeof(*packet));
+  if (!consumed || !packet || (!p && n) || event < 0 || event > NANOAMTQ_STREAM_RESET)
+    return NANOAMTQ_ERROR_ARGUMENT;
+  *consumed = 0;
+  int rc = advance(g, now);
+  if (rc)
+    return rc;
+  if (id > AMTQ_VARINT_MAX || (id & 3) != 3 || !(g->config.data_modes & g->peer_modes & 2))
+    return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
+  reliable_stream *s = NULL, *empty = NULL;
+  for (unsigned i = 0; i < g->config.max_reliable_streams; ++i) {
+    if (g->streams[i].stage && g->streams[i].id == id)
+      s = g->streams + i;
+    if (!g->streams[i].stage && !empty)
+      empty = g->streams + i;
+  }
+  if (!s) {
+    if (!empty)
+      return protocol(g, NANOAMTQ_CLOSE_EXCESSIVE_LOAD);
+    s = empty;
+    s->id = id;
+    s->stage = 1;
+  }
+  if (event == NANOAMTQ_STREAM_RESET)
+    return stream_end(g, s, event);
+  while (*consumed < n) {
+    if (s->stage == 6) {
+      *consumed = n;
+      break;
+    }
+    if (s->stage != 5) {
+      s->varint[s->varint_size++] = p[(*consumed)++];
+      size_t at = 0;
+      uint64_t value;
+      if (!amtq_get(s->varint, s->varint_size, &at, &value))
+        continue;
+      s->varint_size = 0;
+      if (s->stage == 1)
+        s->stage = value ? 6 : 2;
+      else if (s->stage == 2) {
+        s->context_id = value;
+        s->stage = 3;
+      } else if (s->stage == 3) {
+        context *c = find_context(g, s->context_id);
+        if (!value || !c || !c->reliable || !c->acknowledged || (c->closing && value > c->final_block))
+          return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
+        rc = range_insert(&c->reliable->seen, value);
+        if (rc <= 0)
+          return protocol(g, rc < 0 ? NANOAMTQ_CLOSE_EXCESSIVE_LOAD : NANOAMTQ_CLOSE_CONTEXT);
+        s->block_id = value;
+        s->stage = 4;
+      } else {
+        if (!value || value > NANOAMTQ_MAX_DATA_MESSAGE)
+          return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
+        s->target = (size_t)value;
+        s->size = 0;
+        if (!s->body)
+          s->body = malloc(NANOAMTQ_MAX_DATA_MESSAGE);
+        if (!s->body)
+          return fail(g, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+        s->stage = 5;
+      }
+      continue;
+    }
+    size_t take = s->target - s->size;
+    if (take > n - *consumed)
+      take = n - *consumed;
+    memcpy(s->body + s->size, p + *consumed, take);
+    s->size += take;
+    *consumed += take;
+    if (s->size == s->target) {
+      s->records = 1;
+      s->stage = 4;
+      memcpy(g->message, s->body, s->size);
+      rc = g->reported ? deliver(g, now, s->size, packet) : NANOAMTQ_IGNORED;
+      if (rc == NANOAMTQ_PACKET) {
+        if (*consumed == n && event == NANOAMTQ_STREAM_FIN) {
+          int end = stream_end(g, s, event);
+          if (end) {
+            memset(packet, 0, sizeof(*packet));
+            return end;
+          }
+        }
+        return rc;
+      }
+    }
+  }
+  if (event == NANOAMTQ_STREAM_FIN)
+    return stream_end(g, s, event);
+  return s->stage == 6 ? NANOAMTQ_IGNORED : NANOAMTQ_INCOMPLETE;
 }
