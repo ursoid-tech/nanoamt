@@ -195,12 +195,61 @@ static void admission(int per_source) {
   close(other);
   nanoamt_relay_posix_close(r);
 }
+static void asynchronous_error(void) {
+  nanoamt_relay_posix *r = open_relay(0);
+  nanoamt_endpoint ep;
+  nanoamt_relay_posix_bound(r, &ep);
+  ep.ip[0] = 127;
+  ep.ip[3] = 1;
+  struct sockaddr_storage address;
+  socklen_t len = relay_sockaddr(&ep, &address);
+  int client = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(client >= 0);
+  uint8_t discovery[] = {1, 0, 0, 0, 0, 0, 0, 1};
+  CHECK(sendto(client, discovery, sizeof(discovery), 0, (struct sockaddr *)&address, len) == sizeof(discovery));
+  readable(nanoamt_relay_posix_fd(r));
+  CHECK(nanoamt_relay_posix_receive(r, 0) == NANOAMT_PACKET);
+  close(client); /* the reply will elicit ICMP Port Unreachable */
+  CHECK(nanoamt_relay_posix_send(r, 0) == NANOAMT_PACKET);
+  struct pollfd p = {nanoamt_relay_posix_fd(r), POLLIN, 0};
+  CHECK(poll(&p, 1, 1000) == 1 && (p.revents & POLLERR));
+  CHECK(nanoamt_relay_posix_send(r, 0) == NANOAMT_OK);
+  CHECK(poll(&p, 1, 0) == 0);
+  nanoamt_relay_posix_stats stats;
+  nanoamt_relay_posix_get_stats(r, &stats);
+  CHECK(stats.send_errors == 1);
+  nanoamt_relay_posix_close(r);
+}
+static void multicast_control(void) {
+  nanoamt_relay_posix *r = open_relay(0);
+  nanoamt_endpoint ep;
+  nanoamt_relay_posix_bound(r, &ep);
+  struct ip_mreq request = {0};
+  CHECK(inet_pton(AF_INET, "232.1.2.3", &request.imr_multiaddr) == 1);
+  request.imr_interface.s_addr = htonl(INADDR_LOOPBACK);
+  CHECK(!setsockopt(nanoamt_relay_posix_fd(r), IPPROTO_IP, IP_ADD_MEMBERSHIP, &request, sizeof(request)));
+  memcpy(ep.ip, &request.imr_multiaddr, 4);
+  struct sockaddr_storage address;
+  socklen_t len = relay_sockaddr(&ep, &address);
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(fd >= 0);
+  CHECK(!setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &request.imr_interface, sizeof(request.imr_interface)));
+  uint8_t discovery[] = {1, 0, 0, 0, 0, 0, 0, 1};
+  CHECK(sendto(fd, discovery, sizeof(discovery), 0, (struct sockaddr *)&address, len) == sizeof(discovery));
+  readable(nanoamt_relay_posix_fd(r));
+  CHECK(nanoamt_relay_posix_receive(r, 0) == NANOAMT_IGNORED);
+  CHECK(!nanoamt_relay_posix_wants_write(r));
+  close(fd);
+  nanoamt_relay_posix_close(r);
+}
 int main(void) {
   for (int outer6 = 0; outer6 < 2; ++outer6)
     for (int inner6 = 0; inner6 < 2; ++inner6)
       exchange(outer6, inner6);
   admission(0);
   admission(1);
+  asynchronous_error();
+  multicast_control();
   puts("relay-posix: real UDP, backpressure, withdrawal, expiry and admission passed");
   return 0;
 }

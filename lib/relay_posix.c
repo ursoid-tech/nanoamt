@@ -162,9 +162,11 @@ nanoamt_relay_posix *nanoamt_relay_posix_open(const nanoamt_relay_posix_config *
   if (v6) {
     if (setsockopt(io->fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) ||
         setsockopt(io->fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)) ||
+        setsockopt(io->fd, IPPROTO_IPV6, IPV6_RECVERR, &one, sizeof(one)) ||
         setsockopt(io->fd, IPPROTO_IPV6, IPV6_DONTFRAG, &one, sizeof(one)))
       goto fail;
   } else if (setsockopt(io->fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) ||
+             setsockopt(io->fd, IPPROTO_IP, IP_RECVERR, &one, sizeof(one)) ||
              setsockopt(io->fd, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu)))
     goto fail;
   struct sockaddr_storage address;
@@ -244,8 +246,43 @@ static int relay_source_credit(nanoamt_relay_posix *io, const nanoamt_endpoint *
   return relay_take_credit(&slot->credit, &slot->at, now, io->config.source_rate, io->config.source_burst);
 }
 
+static int relay_drain_errors(nanoamt_relay_posix *io) {
+#ifdef __linux__
+  /* Error payloads identify earlier datagrams, but accepting one at sendmsg
+   * did not promise delivery. Drain bounded work even with no queued output,
+   * so unreachable peers cannot leave the shared listener stuck at POLLERR. */
+  for (unsigned i = 0; i < 32; ++i) {
+    uint8_t byte;
+    struct iovec vec = {&byte, 1};
+    struct msghdr msg = {0};
+    msg.msg_iov = &vec;
+    msg.msg_iovlen = 1;
+    ssize_t n;
+    do {
+      n = recvmsg(io->fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+      return NANOAMT_ERROR_IO;
+    }
+    ++io->stats.send_errors;
+  }
+  int error = 0;
+  socklen_t size = sizeof(error);
+  if (getsockopt(io->fd, SOL_SOCKET, SO_ERROR, &error, &size))
+    return NANOAMT_ERROR_IO;
+#else
+  (void)io;
+#endif
+  return NANOAMT_OK;
+}
+
 int nanoamt_relay_posix_receive(nanoamt_relay_posix *io, int64_t now) {
   int rc = relay_io_tick(io, now);
+  if (rc)
+    return rc;
+  rc = relay_drain_errors(io);
   if (rc)
     return rc;
 #ifndef __linux__
@@ -301,7 +338,8 @@ int nanoamt_relay_posix_receive(nanoamt_relay_posix *io, int64_t now) {
       found = 1;
     }
   }
-  if (!found)
+  if (!found || !peer.port || !address_unicast(peer.ip, peer.ip_version) ||
+      !address_unicast(local.ip, local.ip_version) || ip_version(peer.ip_version) != ip_version(local.ip_version))
     return NANOAMT_IGNORED;
   nanoamt_relay_control reply;
   rc = nanoamt_relay_receive(io->relay, now, &peer, &local, io->input, (size_t)n, &reply);
@@ -421,6 +459,9 @@ static void relay_drop_input(nanoamt_relay_posix *io) {
 }
 int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
   int rc = relay_io_tick(io, now), sent = 0;
+  if (rc)
+    return rc;
+  rc = relay_drain_errors(io);
   if (rc)
     return rc;
   for (unsigned step = 0; step < io->config.send_budget; ++step) {
