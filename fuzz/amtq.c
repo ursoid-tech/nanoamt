@@ -16,6 +16,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *bytes, size_t size) {
   config.random_bytes = fixture_random;
   config.random_context = &random;
   config.max_incomplete = 2;
+  config.data_modes = bytes[0] & 4 ? 3 : 1;
+  config.preferred_mode = bytes[0] & 4 ? 1 : 0;
+  config.max_reliable_streams = 4;
   nanoamtq *g = nanoamtq_new(&config, 0);
   if (!g)
     return 0;
@@ -26,7 +29,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *bytes, size_t size) {
   nanoamtq_control out;
   if (bytes[0] & 1) {
     (void)nanoamtq_send(g, 0, &out);
-    const uint8_t settings[] = {0, 2, 0, 1};
+    const uint8_t settings[] = {0, 2, 0, (uint8_t)config.data_modes};
     (void)nanoamtq_receive_control(g, 0, 0, settings, sizeof(settings), 0);
     (void)nanoamtq_send(g, 0, &out);
     (void)nanoamtq_record_decode(out.bytes, out.size, &record, &consumed);
@@ -39,7 +42,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *bytes, size_t size) {
     (void)nanoamtq_record_encode(&record, encoded, sizeof(encoded), &encoded_size);
     (void)nanoamtq_receive_control(g, 0, 0, encoded, encoded_size, 0);
     (void)nanoamtq_send(g, 0, &out);
-    const uint8_t context[] = {2, 2, 0, 0};
+    const uint8_t context[] = {2, 2, 0, (uint8_t)config.preferred_mode};
     (void)nanoamtq_receive_control(g, 0, 0, context, sizeof(context), 0);
     (void)nanoamtq_send(g, 0, &out);
   }
@@ -52,7 +55,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *bytes, size_t size) {
       n = size - at;
     const uint8_t *p = bytes + at;
     nanoamt_packet packet;
-    switch (operation % 5) {
+    switch (operation % 8) {
     case 0:
       (void)nanoamtq_receive_control(g, now, 0, p, n, 0);
       break;
@@ -68,6 +71,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *bytes, size_t size) {
     case 4:
       (void)nanoamtq_send(g, now, &out);
       break;
+    case 5:
+    case 6:
+    case 7: {
+      size_t offset = 0, used;
+      int event = (int)(operation % 8) - 5;
+      do {
+        int result =
+            nanoamtq_receive_stream(g, now, 3 + 4 * (operation / 8), p + offset, n - offset, event, &used, &packet);
+        CHECK(used <= n - offset);
+        offset += used;
+        if (result != NANOAMTQ_PACKET || !used)
+          break;
+      } while (offset < n);
+      break;
+    }
     }
     (void)nanoamtq_next_timeout(g);
     (void)nanoamtq_is_ready(g);

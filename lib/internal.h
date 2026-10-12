@@ -47,9 +47,10 @@ static inline void write16(uint8_t *p, uint16_t n) {
   p[1] = (uint8_t)n;
 }
 static inline int endpoint_equal(const nanoamt_endpoint *a, const nanoamt_endpoint *b) {
+  int scoped = ip_version(a->ip_version) == 6 &&
+               ((a->ip[0] == 0xfe && (a->ip[1] & 0xc0u) == 0x80u) || (a->ip[0] == 0xff && (a->ip[1] & 15u) <= 2));
   return ip_version(a->ip_version) == ip_version(b->ip_version) && a->port == b->port &&
-         (ip_version(a->ip_version) != 6 || a->scope_id == b->scope_id) &&
-         memcmp(a->ip, b->ip, ip_address_size(a->ip_version)) == 0;
+         (!scoped || a->scope_id == b->scope_id) && memcmp(a->ip, b->ip, ip_address_size(a->ip_version)) == 0;
 }
 static inline int unicast(const uint8_t *p) {
   return p[0] != 0 && p[0] < 224;
@@ -65,6 +66,9 @@ uint16_t nanoamt_checksum(const uint8_t *bytes, size_t size, uint32_t sum);
 int nanoamt_ecn_decapsulate(uint8_t *bytes, size_t size, unsigned outer);
 void nanoamt_ecn_set(uint8_t *bytes, unsigned ecn);
 int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip);
+int nanoamt_ip_forward_decode(const uint8_t *bytes, size_t size, ip_packet *ip);
+size_t nanoamt_general_query(uint8_t *ip, unsigned version, const uint8_t *source, uint8_t qqic, unsigned robustness,
+                             uint32_t response_ms);
 uint32_t nanoamt_pseudo_sum(const ip_packet *ip, uint8_t protocol, size_t size);
 int nanoamt_query_decode(uint8_t *bytes, size_t size, unsigned version, uint32_t *interval_ms, unsigned *robustness);
 int nanoamt_udp_decode(uint8_t *bytes, size_t size, const nanoamt_config *config, nanoamt_packet *packet);

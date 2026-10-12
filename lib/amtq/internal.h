@@ -11,6 +11,13 @@ size_t amtq_varint_size(uint64_t value);
 size_t amtq_put(uint8_t *out, uint64_t value);
 int amtq_get(const uint8_t *bytes, size_t size, size_t *at, uint64_t *value);
 int amtq_header(const uint8_t *bytes, size_t size, uint64_t *type, size_t *length, size_t *header);
+typedef struct amtq_control_reader {
+  uint8_t bytes[NANOAMTQ_MAX_CONTROL_VALUE + 16];
+  size_t size, target;
+} amtq_control_reader;
+int amtq_control_feed(amtq_control_reader *reader, const uint8_t *bytes, size_t size, size_t *consumed,
+                      int (*handle)(void *, uint64_t, uint8_t *, size_t), void *context);
+int amtq_settings_decode(const uint8_t *bytes, size_t size, int sender_relay, uint64_t *modes, uint64_t *preferred);
 
 typedef struct amtq_fragment_slot {
   uint64_t context, id;

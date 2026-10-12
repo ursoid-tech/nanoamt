@@ -12,6 +12,8 @@ extern "C" {
 #define NANOAMTQ_MAX_DATA_MESSAGE 65577U
 #define NANOAMTQ_MAX_MEMBERSHIPS 64U
 #define NANOAMTQ_MAX_CONTEXTS 64U
+#define NANOAMTQ_MAX_RELIABLE_STREAMS 64U
+#define NANOAMTQ_MAX_BLOCK_RANGES 1024U
 #define NANOAMTQ_CONTROL_CAPACITY 8192U
 
 enum {
@@ -19,11 +21,16 @@ enum {
   NANOAMTQ_PACKET = 1,
   NANOAMTQ_IGNORED = 2,
   NANOAMTQ_INCOMPLETE = 3,
+  NANOAMTQ_MEMBERSHIP = 4,
   NANOAMTQ_ERROR_ARGUMENT = -1,
   NANOAMTQ_ERROR_BUFFER = -2,
   NANOAMTQ_ERROR_PROTOCOL = -3,
   NANOAMTQ_ERROR_RANDOM = -4,
-  NANOAMTQ_ERROR_TIMEOUT = -5
+  NANOAMTQ_ERROR_TIMEOUT = -5,
+  NANOAMTQ_ERROR_MEMORY = -6,
+  NANOAMTQ_ERROR_LIMIT = -7,
+  NANOAMTQ_ERROR_POLICY = -8,
+  NANOAMTQ_ERROR_STALE = -9
 };
 enum {
   NANOAMTQ_CLOSE_PROTOCOL = 0x100,
@@ -41,7 +48,9 @@ enum {
   NANOAMTQ_CONTEXT_CLOSE = 3,
   NANOAMTQ_CONTEXT_ACK = 4
 };
-enum { NANOAMTQ_COMPLETE = 0, NANOAMTQ_FRAGMENT = 1 };
+enum { NANOAMTQ_COMPLETE = 0, NANOAMTQ_FRAGMENT = 1, NANOAMTQ_RELIABLE_RECORD = 2 };
+enum { NANOAMTQ_MODE_DATAGRAM = 0, NANOAMTQ_MODE_RELIABLE = 1 };
+enum { NANOAMTQ_STREAM_DATA = 0, NANOAMTQ_STREAM_FIN = 1, NANOAMTQ_STREAM_RESET = 2 };
 
 typedef struct nanoamtq_record {
   uint64_t type;
@@ -69,6 +78,9 @@ typedef struct nanoamtq_config {
   uint32_t reassembly_timeout_ms;
   uint32_t control_timeout_ms;
   uint32_t refresh_cap_ms;
+  unsigned data_modes;           /* 0/1: Datagram; 3: Datagram and Reliable Block. */
+  unsigned preferred_mode;       /* 0: Datagram, 1: Reliable Block. */
+  unsigned max_reliable_streams; /* 0: 64; adapter must grant this uni stream credit. */
 } nanoamtq_config;
 typedef struct nanoamtq_membership {
   uint8_t source[16], group[16];
@@ -88,7 +100,19 @@ int nanoamtq_receive_control(nanoamtq *gateway, int64_t now_ms, uint64_t stream_
                              int fin);
 int nanoamtq_receive_datagram(nanoamtq *gateway, int64_t now_ms, const uint8_t *bytes, size_t size,
                               nanoamt_packet *packet);
+/* Ordered bytes from a server-initiated unidirectional stream (id % 4 == 3).
+ * Stops after one delivered packet: retain the suffix after *consumed. FIN is
+ * applied only when all supplied bytes are consumed. RESET of a known block
+ * is fatal; unknown stream types are drained without allocating record bodies.
+ * A completed stream must not be submitted again. Packet ownership is the same
+ * as receive_datagram; either receive operation invalidates the previous view. */
+int nanoamtq_receive_stream(nanoamtq *gateway, int64_t now_ms, uint64_t stream_id, const uint8_t *bytes, size_t size,
+                            int event, size_t *consumed, nanoamt_packet *packet);
+int nanoamtq_context_mode(const nanoamtq *gateway, uint64_t context_id);
 int64_t nanoamtq_next_timeout(const nanoamtq *gateway);
+/* Current desired memberships have been submitted to the control transport.
+ * This is a local setup milestone, not authorization or delivery confirmation. */
+int nanoamtq_memberships_submitted(const nanoamtq *gateway);
 int nanoamtq_is_ready(const nanoamtq *gateway);
 int nanoamtq_error(const nanoamtq *gateway);
 uint64_t nanoamtq_close_error(const nanoamtq *gateway);
