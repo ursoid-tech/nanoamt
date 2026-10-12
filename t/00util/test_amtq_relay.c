@@ -1,5 +1,6 @@
 #include "fixtures.h"
 #include "nanoamt/amtq_relay.h"
+#include "amtq_reliable_vectors.h"
 #include <limits.h>
 
 typedef struct pair {
@@ -19,7 +20,7 @@ static nanoamtq_membership interest(const nanoamt_config *c) {
   m.port = c->port;
   return m;
 }
-static void init(pair *p, int ipv6, int asm_mode) {
+static void init_mode(pair *p, int ipv6, int asm_mode, unsigned mode) {
   memset(p, 0, sizeof(*p));
   p->resolve = 1;
   p->config = fixture_dual_config(&p->random, 0, ipv6, asm_mode);
@@ -28,13 +29,20 @@ static void init(pair *p, int ipv6, int asm_mode) {
   g.random_bytes = fixture_random;
   g.random_context = &p->random;
   g.max_fragment_ranges = 1024;
+  g.data_modes = mode ? 3 : 1;
+  g.preferred_mode = mode;
   p->gateway = nanoamtq_new(&g, 0);
   nanoamtq_relay_config r = {0};
   r.connection_id = p->connection_id = ++connection_ids;
+  r.data_modes = mode ? 3 : 1;
+  r.peer_max_uni_streams = mode ? 64 : 0;
   p->relay = nanoamtq_relay_new(&r, 0);
   CHECK(p->gateway && p->relay);
   nanoamtq_membership m = interest(&p->config);
   CHECK(!nanoamtq_set_memberships(p->gateway, &m, 1));
+}
+static void init(pair *p, int ipv6, int asm_mode) {
+  init_mode(p, ipv6, asm_mode, 0);
 }
 static void cleanup(pair *p) {
   nanoamtq_free(p->gateway);
@@ -57,7 +65,7 @@ static int gateway_step(pair *p, int64_t now) {
         uint64_t generation = nanoamtq_relay_generation(p->relay);
         CHECK(!nanoamtq_relay_authorize_all(p->relay, now, generation));
         if (!p->context_opened && nanoamt_memberships_count(nanoamtq_relay_authorized(p->relay))) {
-          CHECK(!nanoamtq_relay_open_context(p->relay, now, 0));
+          CHECK(!nanoamtq_relay_open_context_mode(p->relay, now, 0, (unsigned)nanoamtq_relay_preferred_mode(p->relay)));
           p->context_opened = 1;
         }
       }
@@ -598,6 +606,297 @@ static void timeout(void) {
   CHECK(nanoamtq_relay_tick(p.relay, 10000) == NANOAMTQ_ERROR_TIMEOUT);
   cleanup(&p);
 }
+
+static int gateway_control(pair *p, uint64_t type, const uint8_t *bytes, size_t n) {
+  uint8_t encoded[128];
+  size_t size;
+  nanoamtq_record r = {type, bytes, n};
+  CHECK(!nanoamtq_record_encode(&r, encoded, sizeof(encoded), &size));
+  return nanoamtq_receive_control(p->gateway, 0, 0, encoded, size, 0);
+}
+static void reliable(void) {
+  for (int ipv6 = 0; ipv6 < 2; ++ipv6) {
+    pair p;
+    init_mode(&p, ipv6, 0, 1);
+    drive(&p, 0);
+    CHECK(nanoamtq_relay_preferred_mode(p.relay) == 1);
+    CHECK(nanoamtq_context_mode(p.gateway, 0) == 1);
+    uint8_t ip[2048], wire[4096], header[24];
+    size_t n = packet(ip, &p.config, 1234), hn, used;
+    uint64_t block;
+    nanoamt_packet received;
+    nanoamtq_relay_datagram_output out;
+    CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &block, header, 0, &hn) == NANOAMTQ_ERROR_BUFFER);
+    CHECK(!block && hn == 3);
+    CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &block, header, sizeof(header), &hn) == NANOAMTQ_PACKET);
+    CHECK(block == 1 && hn == 3 && !memcmp(header, "\0\0\1", 3));
+    CHECK(nanoamtq_relay_reliable_finish(p.relay, 0, 0, block) == NANOAMTQ_ERROR_ARGUMENT);
+    CHECK(nanoamtq_relay_close_context(p.relay, 0, 0) == NANOAMTQ_ERROR_LIMIT);
+    for (size_t i = 0; i < hn; ++i) {
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, header + i, 1, 0, &used, &received) == NANOAMTQ_INCOMPLETE);
+      CHECK(used == 1 && !received.size);
+    }
+    CHECK(nanoamtq_relay_reliable_record(p.relay, 0, 0, block, ip, n, wire, 1, &out) == NANOAMTQ_ERROR_BUFFER);
+    CHECK(nanoamtq_relay_reliable_finish(p.relay, 0, 0, block) == NANOAMTQ_ERROR_ARGUMENT);
+    CHECK(nanoamtq_relay_reliable_record(p.relay, 0, 0, block, ip, n, wire, sizeof(wire), &out) == NANOAMTQ_PACKET);
+    CHECK(nanoamtq_relay_reliable_valid(p.relay, 0, &out, wire, out.size));
+    /* Every byte boundary, then two records coalesced with FIN. */
+    for (size_t i = 0; i < out.size; ++i) {
+      int rc = nanoamtq_receive_stream(p.gateway, 0, 3, wire + i, 1, 0, &used, &received);
+      CHECK(rc == (i + 1 == out.size ? NANOAMTQ_PACKET : NANOAMTQ_INCOMPLETE));
+      CHECK(used == 1);
+    }
+    CHECK(received.size == 1234 && !memcmp(received.data, ip + (ipv6 ? 48 : 28), 1234));
+    memcpy(wire + out.size, wire, out.size);
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, wire, 2 * out.size, 1, &used, &received) == NANOAMTQ_PACKET);
+    CHECK(used == out.size);
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, wire + used, out.size, 1, &used, &received) == NANOAMTQ_PACKET);
+    CHECK(used == out.size);
+    CHECK(!nanoamtq_relay_reliable_finish(p.relay, 0, 0, block));
+    CHECK(nanoamtq_relay_reliable_valid(p.relay, 0, &out, wire, out.size));
+    CHECK(!nanoamtq_relay_close_context(p.relay, 0, 0));
+    CHECK(nanoamtq_relay_reliable_valid(p.relay, 0, &out, wire, out.size));
+    drive(&p, 0);
+    CHECK(nanoamtq_context_mode(p.gateway, 0) == -1);
+    CHECK(nanoamtq_relay_reliable_valid(p.relay, 0, &out, wire, out.size));
+    CHECK(!nanoamtq_relay_release_context(p.relay, 0, 0));
+    CHECK(!nanoamtq_relay_reliable_valid(p.relay, 0, &out, wire, out.size));
+    CHECK(!nanoamtq_relay_open_context_mode(p.relay, 0, 1, 1));
+    drive(&p, 0);
+    CHECK(nanoamtq_context_mode(p.gateway, 1) == 1);
+    CHECK(!nanoamtq_relay_close_context(p.relay, 0, 1));
+    drive(&p, 0); /* Final Block ID zero closes an unused context. */
+    CHECK(nanoamtq_context_mode(p.gateway, 1) == -1);
+    cleanup(&p);
+  }
+}
+static void reliable_drain(void) {
+  pair p;
+  init_mode(&p, 0, 0, 1);
+  drive(&p, 0);
+  uint8_t ip[128], wire[256], h[24];
+  size_t n = packet(ip, &p.config, 16), hn, used;
+  nanoamtq_relay_datagram_output out[3];
+  nanoamt_packet received;
+  uint8_t blocks[3][256];
+  size_t lengths[3];
+  for (unsigned i = 0; i < 3; ++i) {
+    uint64_t id;
+    CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &id, h, sizeof(h), &hn) == NANOAMTQ_PACKET);
+    CHECK(id == i + 1);
+    CHECK(nanoamtq_relay_reliable_record(p.relay, 0, 0, id, ip, n, wire, sizeof(wire), &out[i]) == NANOAMTQ_PACKET);
+    memcpy(blocks[i], h, hn);
+    memcpy(blocks[i] + hn, wire, out[i].size);
+    lengths[i] = hn + out[i].size;
+    CHECK(!nanoamtq_relay_reliable_finish(p.relay, 0, 0, id));
+  }
+  CHECK(!nanoamtq_relay_close_context(p.relay, 0, 0));
+  drive(&p, 0);
+  CHECK(nanoamtq_context_mode(p.gateway, 0) == 1);
+  CHECK(nanoamtq_next_timeout(p.gateway) == 10000);
+  /* Control CLOSE and higher block IDs can arrive before lower stream IDs. */
+  unsigned order[] = {2, 0, 1};
+  for (unsigned i = 0; i < 3; ++i) {
+    unsigned which = order[i];
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3 + 4 * which, blocks[which], lengths[which], 1, &used, &received) ==
+          NANOAMTQ_PACKET);
+    CHECK(used == lengths[which] && received.size == 16);
+    CHECK(nanoamtq_context_mode(p.gateway, 0) == (i == 2 ? -1 : 1));
+  }
+  cleanup(&p);
+  /* Withdrawals remove local delivery immediately even within a partial record. */
+  init_mode(&p, 0, 0, 1);
+  drive(&p, 0);
+  CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, blocks[0], 5, 0, &used, &received) == NANOAMTQ_INCOMPLETE);
+  CHECK(!nanoamtq_set_memberships(p.gateway, NULL, 0));
+  CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, blocks[0] + 5, lengths[0] - 5, 1, &used, &received) == NANOAMTQ_OK);
+  CHECK(!received.size);
+  cleanup(&p);
+}
+static void reliable_errors(void) {
+  static const uint8_t bad[][8] = {
+      {0},                       /* incomplete header FIN */
+      {0, 0, 1},                 /* empty block FIN */
+      {0, 0, 1, 0},              /* zero length */
+      {0, 0, 1, 2, 6},           /* partial body FIN */
+      {0, 0, 0},                 /* zero block ID */
+      {0, 1, 1},                 /* unknown context */
+      {0, 0, 1, 0x80, 1, 0, 42}, /* oversized record */
+  };
+  static const size_t sizes[] = {1, 3, 4, 5, 3, 3, 7};
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i) {
+    pair p;
+    init_mode(&p, 0, 0, 1);
+    drive(&p, 0);
+    nanoamt_packet received;
+    size_t used;
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, bad[i], sizes[i], 1, &used, &received) == NANOAMTQ_ERROR_PROTOCOL);
+    CHECK(!received.size && nanoamtq_error(p.gateway) == NANOAMTQ_ERROR_PROTOCOL);
+    cleanup(&p);
+  }
+  for (unsigned scenario = 0; scenario < 9; ++scenario) {
+    pair p;
+    init_mode(&p, 0, 0, 1);
+    drive(&p, 0);
+    nanoamt_packet received;
+    size_t used;
+    if (scenario == 0) {
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, (uint8_t[]){0, 0, 1}, 3, 0, &used, &received) ==
+            NANOAMTQ_INCOMPLETE);
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 7, (uint8_t[]){0, 0, 1}, 3, 0, &used, &received) ==
+            NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 1) {
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, (uint8_t[]){0, 0, 1}, 3, 0, &used, &received) ==
+            NANOAMTQ_INCOMPLETE);
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, NULL, 0, 2, &used, &received) == NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 2) {
+      CHECK(gateway_control(&p, NANOAMTQ_CONTEXT_CLOSE, (uint8_t[]){0}, 1) == NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 3) {
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, (uint8_t[]){0, 0, 2}, 3, 0, &used, &received) ==
+            NANOAMTQ_INCOMPLETE);
+      CHECK(gateway_control(&p, NANOAMTQ_CONTEXT_CLOSE, (uint8_t[]){0, 1}, 2) == NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 4) {
+      CHECK(!gateway_control(&p, NANOAMTQ_CONTEXT_CLOSE, (uint8_t[]){0, 1}, 2));
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, (uint8_t[]){0, 0, 2}, 3, 0, &used, &received) ==
+            NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 5) {
+      CHECK(!gateway_control(&p, NANOAMTQ_CONTEXT_CLOSE, (uint8_t[]){0, 1}, 2));
+      nanoamtq_control out;
+      CHECK(nanoamtq_send(p.gateway, 10000, &out) == NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 6) {
+      CHECK(nanoamtq_receive_stream(p.gateway, 0, 2, (uint8_t[]){0, 0, 1}, 3, 0, &used, &received) ==
+            NANOAMTQ_ERROR_PROTOCOL);
+    } else if (scenario == 7) {
+      CHECK(nanoamtq_receive_datagram(p.gateway, 0, (uint8_t[]){0, 0, 6}, 3, &received) == NANOAMTQ_ERROR_PROTOCOL);
+    } else {
+      uint64_t block;
+      uint8_t header[24];
+      size_t hn;
+      CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &block, header, sizeof(header), &hn) == NANOAMTQ_PACKET);
+      CHECK(nanoamtq_relay_reliable_abort(p.relay, 0, 0, block) == NANOAMTQ_ERROR_PROTOCOL);
+    }
+    CHECK(scenario == 8 ? nanoamtq_relay_close_error(p.relay) : nanoamtq_close_error(p.gateway));
+    cleanup(&p);
+  }
+  pair p;
+  init_mode(&p, 0, 0, 1);
+  drive(&p, 0);
+  nanoamt_packet received;
+  size_t used;
+  /* Unknown types are skipped, including unknown stream RESET, without data storage. */
+  CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, (uint8_t[]){42, 0, 0, 0}, 4, 0, &used, &received) == NANOAMTQ_IGNORED);
+  CHECK(used == 4 && !nanoamtq_receive_stream(p.gateway, 0, 3, NULL, 0, 2, &used, &received));
+  CHECK(!nanoamtq_error(p.gateway));
+  cleanup(&p);
+}
+static void reliable_bounds(void) {
+  pair p;
+  init_mode(&p, 0, 0, 1);
+  drive(&p, 0);
+  nanoamt_packet received;
+  size_t used;
+  for (unsigned i = 0; i < 64; ++i)
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3 + 4 * i, (uint8_t[]){42}, 1, 0, &used, &received) ==
+          NANOAMTQ_IGNORED);
+  CHECK(nanoamtq_receive_stream(p.gateway, 0, 259, (uint8_t[]){42}, 1, 0, &used, &received) == NANOAMTQ_ERROR_PROTOCOL);
+  CHECK(nanoamtq_close_error(p.gateway) == NANOAMTQ_CLOSE_EXCESSIVE_LOAD);
+  cleanup(&p);
+  init_mode(&p, 0, 0, 1);
+  drive(&p, 0);
+  uint8_t bytes[32];
+  size_t hn;
+  uint64_t id;
+  for (unsigned i = 0; i < 64; ++i)
+    CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &id, bytes, sizeof(bytes), &hn) == NANOAMTQ_PACKET);
+  CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &id, bytes, sizeof(bytes), &hn) == NANOAMTQ_ERROR_LIMIT);
+  cleanup(&p);
+  /* 2048 contiguous blocks coalesce; 1025 disjoint identifiers hit the cap. */
+  for (unsigned sparse = 0; sparse < 2; ++sparse) {
+    init_mode(&p, 0, 0, 1);
+    drive(&p, 0);
+    unsigned count = sparse ? 1025 : 2048;
+    for (unsigned i = 1; i <= count; ++i) {
+      unsigned id32 = sparse ? 2 * i : i;
+      uint8_t stream[] = {0, 0, (uint8_t)(0x40 | (id32 >> 8)), (uint8_t)id32, 1, 6};
+      int rc = nanoamtq_receive_stream(p.gateway, 0, 3 + 4 * i, stream, sizeof(stream), 1, &used, &received);
+      CHECK(rc == (sparse && i == count ? NANOAMTQ_ERROR_PROTOCOL : NANOAMTQ_OK));
+    }
+    if (sparse)
+      CHECK(nanoamtq_close_error(p.gateway) == NANOAMTQ_CLOSE_EXCESSIVE_LOAD);
+    cleanup(&p);
+  }
+  init_mode(&p, 1, 0, 1);
+  drive(&p, 0);
+  uint8_t *ip = malloc(65575), *wire = malloc(65585);
+  CHECK(ip && wire);
+  size_t n = packet(ip, &p.config, 65527);
+  nanoamtq_relay_datagram_output out;
+  CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 0, &id, bytes, sizeof(bytes), &hn) == NANOAMTQ_PACKET);
+  CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, bytes, hn, 0, &used, &received) == NANOAMTQ_INCOMPLETE);
+  CHECK(nanoamtq_relay_reliable_record(p.relay, 0, 0, id, ip, n, wire, 65585, &out) == NANOAMTQ_PACKET);
+  CHECK(nanoamtq_receive_stream(p.gateway, 0, 3, wire, out.size, 1, &used, &received) == NANOAMTQ_PACKET);
+  CHECK(received.size == 65527 && !memcmp(received.data, ip + 48, 65527));
+  CHECK(!nanoamtq_set_memberships(p.gateway, NULL, 0));
+  drive(&p, 0);
+  CHECK(!nanoamtq_relay_reliable_valid(p.relay, 0, &out, wire, out.size));
+  CHECK(nanoamtq_relay_reliable_record(p.relay, 0, 0, id, ip, n, wire, 65585, &out) == NANOAMTQ_IGNORED);
+  free(ip);
+  free(wire);
+  cleanup(&p);
+}
+
+static void reliable_golden(void) {
+  pair p;
+  init_mode(&p, 0, 0, 1);
+  nanoamtq_control out;
+  size_t used;
+  CHECK(nanoamtq_send(p.gateway, 0, &out) == NANOAMTQ_PACKET);
+  CHECK(out.size == sizeof(golden_gateway_settings) && !memcmp(out.bytes, golden_gateway_settings, out.size));
+  CHECK(!nanoamtq_relay_receive_control(p.relay, 0, 0, golden_gateway_settings, sizeof(golden_gateway_settings), 0,
+                                        &used));
+  CHECK(nanoamtq_relay_send(p.relay, 0, &out) == NANOAMTQ_PACKET);
+  CHECK(out.size == sizeof(golden_relay_settings) && !memcmp(out.bytes, golden_relay_settings, out.size));
+  CHECK(!nanoamtq_receive_control(p.gateway, 0, 0, golden_relay_settings, sizeof(golden_relay_settings), 0));
+  drive(&p, 0);
+  CHECK(!nanoamtq_relay_close_context(p.relay, 0, 0));
+  drive(&p, 0);
+  CHECK(!nanoamtq_relay_release_context(p.relay, 0, 0));
+  CHECK(!nanoamtq_relay_open_context_mode(p.relay, 0, 64, 1));
+  CHECK(nanoamtq_relay_send(p.relay, 0, &out) == NANOAMTQ_PACKET);
+  CHECK(out.size == sizeof(golden_context) && !memcmp(out.bytes, golden_context, out.size));
+  CHECK(!nanoamtq_receive_control(p.gateway, 0, 0, golden_context, sizeof(golden_context), 0));
+  drive(&p, 0);
+  uint8_t header[24], wire[128];
+  nanoamt_packet received;
+  for (uint64_t id = 1; id <= 64; ++id) {
+    uint64_t block;
+    size_t hn;
+    nanoamtq_relay_datagram_output metadata;
+    CHECK(nanoamtq_relay_reliable_begin(p.relay, 0, 64, &block, header, sizeof(header), &hn) == NANOAMTQ_PACKET);
+    CHECK(block == id);
+    if (id == 64)
+      CHECK(hn == sizeof(golden_header) && !memcmp(header, golden_header, hn));
+    CHECK(nanoamtq_relay_reliable_record(p.relay, 0, 64, id, golden_message + 2, sizeof(golden_message) - 2, wire,
+                                         sizeof(wire), &metadata) == NANOAMTQ_PACKET);
+    CHECK(metadata.size == sizeof(golden_record) && !memcmp(wire, golden_record, metadata.size));
+    uint8_t independent_header[] = {0, 0x40, 0x40, (uint8_t)id};
+    const uint8_t *h = id == 64 ? golden_header : independent_header;
+    size_t length = id == 64 ? sizeof(golden_header) : sizeof(independent_header);
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3 + 4 * (id - 1), h, length, 0, &used, &received) ==
+          NANOAMTQ_INCOMPLETE);
+    CHECK(nanoamtq_receive_stream(p.gateway, 0, 3 + 4 * (id - 1), golden_record, sizeof(golden_record), 1, &used,
+                                  &received) == NANOAMTQ_PACKET);
+    CHECK(received.size == 5 && !memcmp(received.data, "hello", 5));
+    CHECK(!nanoamtq_relay_reliable_finish(p.relay, 0, 64, id));
+  }
+  CHECK(!nanoamtq_relay_close_context(p.relay, 0, 64));
+  CHECK(nanoamtq_relay_send(p.relay, 0, &out) == NANOAMTQ_PACKET);
+  CHECK(out.size == sizeof(golden_close) && !memcmp(out.bytes, golden_close, out.size));
+  CHECK(!nanoamtq_receive_control(p.gateway, 0, 0, golden_close, sizeof(golden_close), 0));
+  CHECK(nanoamtq_context_mode(p.gateway, 64) == -1);
+  cleanup(&p);
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   if (!strcmp(argv[1], "exchange"))
@@ -618,6 +917,16 @@ int main(int argc, char **argv) {
     bounds();
   else if (!strcmp(argv[1], "full-state"))
     full_state();
+  else if (!strcmp(argv[1], "reliable-golden"))
+    reliable_golden();
+  else if (!strcmp(argv[1], "reliable"))
+    reliable();
+  else if (!strcmp(argv[1], "reliable-drain"))
+    reliable_drain();
+  else if (!strcmp(argv[1], "reliable-errors"))
+    reliable_errors();
+  else if (!strcmp(argv[1], "reliable-bounds"))
+    reliable_bounds();
   else if (!strcmp(argv[1], "timeout"))
     timeout();
   else

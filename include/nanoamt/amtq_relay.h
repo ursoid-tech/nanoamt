@@ -19,6 +19,7 @@ typedef struct nanoamtq_relay_config {
   uint32_t control_timeout_ms; /* 0: 10000; also bounds authorization waits */
   uint32_t query_interval_ms;  /* 0: 125000; rounded up to wire QQIC */
   uint32_t query_response_ms;  /* 0: 10000 */
+  unsigned data_modes;         /* 0/1: Datagram; 3: Datagram and Reliable Block. */
   unsigned robustness;         /* 0: 2, maximum 7 */
 } nanoamtq_relay_config;
 
@@ -56,6 +57,7 @@ int nanoamtq_relay_send(nanoamtq_relay *relay, int64_t now_ms, nanoamtq_control 
 const nanoamt_memberships *nanoamtq_relay_requested(const nanoamtq_relay *relay);
 const nanoamt_memberships *nanoamtq_relay_authorized(const nanoamtq_relay *relay);
 uint64_t nanoamtq_relay_generation(const nanoamtq_relay *relay);
+uint64_t nanoamtq_relay_authorization_revision(const nanoamtq_relay *relay);
 int nanoamtq_relay_pending(const nanoamtq_relay *relay);
 /* Prepare a bounded subset of requested state BEFORE installing native joins.
  * Commit has no allocations. Tokens bind connection, request generation and
@@ -75,11 +77,18 @@ void nanoamtq_relay_authorization_free(nanoamtq_authorization *token);
 int nanoamtq_relay_authorize_all(nanoamtq_relay *relay, int64_t now_ms, uint64_t generation);
 int nanoamtq_relay_deny(nanoamtq_relay *relay, int64_t now_ms, uint64_t generation);
 
-/* Datagram contexts only in this milestone. Context 0 must open first, IDs
+/* Context 0 must open first, IDs
  * subsequently increase without reuse. Data waits for ACK. Closing an active
  * context revokes queued data immediately and queues CONTEXT_CLOSE. */
 int nanoamtq_relay_open_context(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id);
+int nanoamtq_relay_open_context_mode(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id, unsigned mode);
+int nanoamtq_relay_context_mode(const nanoamtq_relay *relay, uint64_t context_id);
+int nanoamtq_relay_preferred_mode(const nanoamtq_relay *relay);
 int nanoamtq_relay_close_context(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id);
+/* Release a reliably closed context only after QUIC has retired all its streams.
+ * Until release, issued records remain valid for retransmission while authorized.
+ * Returns ERROR_ARGUMENT for active, closing (not yet emitted), or unknown IDs. */
+int nanoamtq_relay_release_context(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id);
 
 typedef struct nanoamtq_relay_cursor {
   const nanoamtq_relay *owner;
@@ -88,7 +97,7 @@ typedef struct nanoamtq_relay_cursor {
   uint64_t context_id, packet_id;
 } nanoamtq_relay_cursor;
 typedef struct nanoamtq_relay_datagram_output {
-  uint64_t connection_id, context_id, packet_id;
+  uint64_t connection_id, context_id, packet_id; /* packet_id is Block ID for reliable records. */
   size_t size, offset, total_size;
   uint8_t format, ip_version, source[16], group[16];
 } nanoamtq_relay_datagram_output;
@@ -108,6 +117,22 @@ int nanoamtq_relay_datagram_next(nanoamtq_relay *relay, int64_t now_ms, nanoamtq
  * both complete messages and fragments already framed by next(). */
 int nanoamtq_relay_datagram_valid(nanoamtq_relay *relay, int64_t now_ms, const nanoamtq_relay_datagram_output *output,
                                   const uint8_t *bytes, size_t size);
+
+/* Reliable blocks use server-initiated unidirectional streams. Begin emits the
+ * stream header, record emits one length-prefixed AMT Data message. Hold each
+ * encoded buffer through partial QUIC writes and revalidate before submission.
+ * Finish follows acceptance of a FIN after at least one complete record. Close
+ * refuses while blocks remain open; emitted CLOSE carries the final Block ID.
+ * RESET or STOP_SENDING of a live reliable block fails the connection. */
+int nanoamtq_relay_reliable_begin(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id, uint64_t *block_id,
+                                  uint8_t *bytes, size_t capacity, size_t *size);
+int nanoamtq_relay_reliable_record(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id, uint64_t block_id,
+                                   const uint8_t *ip, size_t size, uint8_t *bytes, size_t capacity,
+                                   nanoamtq_relay_datagram_output *output);
+int nanoamtq_relay_reliable_valid(nanoamtq_relay *relay, int64_t now_ms, const nanoamtq_relay_datagram_output *output,
+                                  const uint8_t *bytes, size_t size);
+int nanoamtq_relay_reliable_finish(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id, uint64_t block_id);
+int nanoamtq_relay_reliable_abort(nanoamtq_relay *relay, int64_t now_ms, uint64_t context_id, uint64_t block_id);
 
 #ifdef __cplusplus
 }
