@@ -1,0 +1,26 @@
+name: Linux kernel interoperability
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    name: Linux AMT relay (IPv4 SSM and ASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl iproute2 util-linux kmod
+
+      - name: Require AMT kernel support
+        run: sudo modprobe amt
+
+      - name: Run tests with isolated network namespaces
+        # IPv6 remains opt-in until the kernel's RFC Request P-bit bug is fixed.
+        run: sudo env NANOAMT_KERNEL_TEST=1 make -j2 check
