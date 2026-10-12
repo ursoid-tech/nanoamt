@@ -125,7 +125,8 @@ static unsigned response_value(unsigned milliseconds) {
   return qqic_value(code) * 100;
 }
 nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now) {
-  if (!config || !config->random_bytes || !config->response_mac || now < 0 || now == INT64_MAX)
+  if (!config || !config->random_bytes || !config->response_mac || now < 0 || now == INT64_MAX ||
+      (config->linux_gateway_family && config->linux_gateway_family != 4 && config->linux_gateway_family != 6))
     return NULL;
   nanoamt_relay_config c = *config;
   if (!c.max_clients)
@@ -571,6 +572,12 @@ int nanoamt_relay_receive(nanoamt_relay *r, int64_t now, const nanoamt_endpoint 
     ++r->stats.discoveries;
   } else {
     unsigned version = (p[1] & 1u) ? 6 : 4, ecn = (p[1] >> 1) & 1u;
+    if (r->config.linux_gateway_family) {
+      version = p[1] & 0x80u ? 6u : 4u;
+      if (version != r->config.linux_gateway_family)
+        return NANOAMT_IGNORED;
+      ecn = 0;
+    }
     out->bytes[0] = MEMBERSHIP_QUERY;
     out->bytes[1] = (uint8_t)(1u | (r->stats.clients == r->config.max_clients ? 2u : 0u));
     rc = mac(r, r->secret, peer, p + 4, version, ecn, out->bytes + 2);
@@ -589,6 +596,12 @@ int nanoamt_relay_receive(nanoamt_relay *r, int64_t now, const nanoamt_endpoint 
     } else
       memcpy(address + 2, peer->ip, 16);
     out->size = 12 + length + 18;
+    if (r->config.linux_gateway_family) {
+      /* Old kernels reject the RFC G flag as reserved. Omitting this
+       * optional trailer is valid RFC wire and leaves cookie binding intact. */
+      out->bytes[1] = 0;
+      out->size = 12 + length;
+    }
     ++r->stats.requests;
   }
   return NANOAMT_PACKET;

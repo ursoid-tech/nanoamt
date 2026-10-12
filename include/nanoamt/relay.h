@@ -35,6 +35,10 @@ typedef struct nanoamt_relay_config {
   int (*authorize)(void *context, const nanoamt_endpoint *peer, const nanoamt_memberships *requested,
                    const nanoamt_memberships *aggregate);
   void *authorize_context;
+  /* Explicit workaround for Linux AMT gateway flag-bit bugs. 0: RFC wire;
+   * 4/6: only that inner family, legacy Request P bit, no optional Query
+   * gateway-address trailer. Use a separate listener for the other family. */
+  unsigned linux_gateway_family;
 } nanoamt_relay_config;
 
 typedef struct nanoamt_relay_control {
