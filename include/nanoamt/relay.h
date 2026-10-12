@@ -13,6 +13,7 @@ typedef struct nanoamt_relay_config {
   uint8_t query_source4[16], query_source6[16];
   unsigned max_clients;        /* 0: 64; maximum 1024 */
   unsigned max_clients_per_ip; /* 0: 16 */
+  unsigned max_fanout_entries; /* 0: 65536; maximum 1048576 canonical subscriber keys */
   nanoamt_membership_config memberships, aggregate;
   uint32_t query_interval_ms;  /* 0: 125000; rounded up to wire QQIC */
   uint32_t query_response_ms;  /* 0: 10000 */
@@ -45,6 +46,7 @@ enum { NANOAMT_RELAY_DATA = 0, NANOAMT_RELAY_MTU_FEEDBACK = 1 };
 typedef struct nanoamt_relay_output {
   nanoamt_endpoint source, destination;
   uint64_t tunnel_id;
+  uint16_t client_slot; /* private validation hint; tunnel_id and endpoints are still checked */
   size_t size;
   uint32_t mtu; /* FEEDBACK: inner MTU, destination is the multicast source */
   uint8_t kind, tos, dont_fragment;
@@ -66,7 +68,8 @@ typedef struct nanoamt_relay_stats {
    * adapter submits them. They do not assert socket acceptance or delivery. */
   uint64_t discoveries, requests, updates, teardowns, bad_mac, malformed;
   uint64_t limited, denied, expired, data_packets, data_bytes, mtu_drops;
-  size_t clients;
+  size_t clients, fanout_entries;
+  uint64_t fanout_candidates, fanout_rebuilds, timer_scans;
 } nanoamt_relay_stats;
 
 nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now_ms);
