@@ -1,0 +1,64 @@
+name: CI
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang perl
+
+      - name: Run tests
+        run: make -j2 check CC=${{ matrix.cc }}
+
+      - name: Test portable builds
+        run: |
+          make -j2 check CC=${{ matrix.cc }} BUILD_DIR=build-portable NANOAMT_BUILD_POSIX=0
+          make -j2 check CC=${{ matrix.cc }} BUILD_DIR=build-core NANOAMT_BUILD_POSIX=0 NANOAMT_BUILD_AMTQ=0
+
+  sanitize:
+    name: Sanitizers and fuzz smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang perl python3
+
+      - name: Run tests with AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make -j2 sanitize CC=clang
+
+      - name: Build fuzzers and seed corpora
+        run: |
+          make -j2 fuzz fuzz-amtq FUZZ_CC=clang
+          python3 fuzz/seeds.py build/corpus
+          python3 fuzz/amtq_seeds.py build/corpus-amtq
+
+      - name: Fuzz AMT and AMTQ
+        run: |
+          build/fuzz-nanoamt build/corpus -runs=10000 -max_len=65536 -timeout=10
+          build/fuzz-amtq build/corpus-amtq -runs=10000 -max_len=131072 -timeout=10
