@@ -1,5 +1,68 @@
 #include "internal.h"
 
+size_t nanoamt_general_query(uint8_t *ip, unsigned version, const uint8_t *source, uint8_t qqic, unsigned robustness,
+                             uint32_t response_ms) {
+  size_t header = version == 6 ? 48 : 24, body = version == 6 ? 28 : 12;
+  memset(ip, 0, header + body);
+  uint8_t *q = ip + header;
+  if (version == 6) {
+    ip[0] = 0x60;
+    write16(ip + 4, (uint16_t)(8 + body));
+    ip[7] = 1;
+    if (source)
+      memcpy(ip + 8, source, 16);
+    ip[24] = 255;
+    ip[25] = 2;
+    ip[39] = 1;
+    memcpy(ip + 40, (uint8_t[]){58, 0, 5, 2, 0, 0, 1, 0}, 8);
+    q[0] = 130;
+    /* Round upward to the representable MLD maximum response code. */
+    unsigned code = response_ms;
+    if (code >= 32768) {
+      code = 0x8000;
+      while (code < 65535) {
+        uint32_t value = ((code & 4095u) | 4096u) << (((code >> 12) & 7u) + 3);
+        if (value >= response_ms)
+          break;
+        ++code;
+      }
+    }
+    write16(q + 4, (uint16_t)code);
+    q[24] = (uint8_t)robustness;
+    q[25] = qqic;
+    ip_packet view = {0};
+    view.version = 6;
+    view.source = ip + 8;
+    view.destination = ip + 24;
+    write16(q + 2, nanoamt_checksum(q, body, nanoamt_pseudo_sum(&view, 58, body)));
+  } else {
+    ip[0] = 0x46;
+    ip[1] = 0xc0;
+    write16(ip + 2, (uint16_t)(header + body));
+    ip[8] = 1;
+    ip[9] = 2;
+    if (source)
+      memcpy(ip + 12, source, 4);
+    ip[16] = 224;
+    ip[19] = 1;
+    ip[20] = 0x94;
+    ip[21] = 4;
+    write16(ip + 10, nanoamt_checksum(ip, header, 0));
+    q[0] = 0x11;
+    unsigned units = (response_ms + 99u) / 100u, code = units;
+    if (units >= 128) {
+      code = 128;
+      while (code < 255 && (((code & 15u) | 16u) << (((code >> 4) & 7u) + 3)) < units)
+        ++code;
+    }
+    q[1] = (uint8_t)code;
+    q[8] = (uint8_t)robustness;
+    q[9] = qqic;
+    write16(q + 2, nanoamt_checksum(q, body, 0));
+  }
+  return header + body;
+}
+
 int nanoamt_query_decode(uint8_t *bytes, size_t size, unsigned version, uint32_t *interval_ms, unsigned *robustness) {
   ip_packet ip;
   static const uint8_t all_hosts[4] = {224, 0, 0, 1},

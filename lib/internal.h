@@ -65,6 +65,9 @@ uint16_t nanoamt_checksum(const uint8_t *bytes, size_t size, uint32_t sum);
 int nanoamt_ecn_decapsulate(uint8_t *bytes, size_t size, unsigned outer);
 void nanoamt_ecn_set(uint8_t *bytes, unsigned ecn);
 int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip);
+int nanoamt_ip_forward_decode(const uint8_t *bytes, size_t size, ip_packet *ip);
+size_t nanoamt_general_query(uint8_t *ip, unsigned version, const uint8_t *source, uint8_t qqic, unsigned robustness,
+                             uint32_t response_ms);
 uint32_t nanoamt_pseudo_sum(const ip_packet *ip, uint8_t protocol, size_t size);
 int nanoamt_query_decode(uint8_t *bytes, size_t size, unsigned version, uint32_t *interval_ms, unsigned *robustness);
 int nanoamt_udp_decode(uint8_t *bytes, size_t size, const nanoamt_config *config, nanoamt_packet *packet);

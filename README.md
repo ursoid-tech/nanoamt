@@ -8,3 +8,8 @@ Lightweight C implementation of Automatic Multicast Tunneling (AMT, [RFC 7450](h
 make
 make check
 ```
+
+The classic AMT relay core and shared IGMP/MLD reception-state API are
+available through `nanoamt/relay.h` and `nanoamt/membership.h`.
+See [relay integration and implementation milestones](docs/relay.md) for
+the API contract, optional OpenSSL provider, and AMTQ/qlinq runtime work.

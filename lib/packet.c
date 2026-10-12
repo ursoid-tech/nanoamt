@@ -13,12 +13,16 @@ uint16_t nanoamt_checksum(const uint8_t *bytes, size_t size, uint32_t sum) {
   return (uint16_t)~sum;
 }
 
-static int ipv4_decode(uint8_t *bytes, size_t size, ip_packet *ip) {
+static int ipv4_decode(uint8_t *bytes, size_t size, ip_packet *ip, int fragments) {
   if (size < 20 || bytes[0] >> 4 != 4)
     return 0;
   size_t header = (bytes[0] & 15u) * 4u, total = read16(bytes + 2);
-  if (header < 20 || header > size || total < header || total > size || (read16(bytes + 6) & 0xbfff) != 0 ||
-      nanoamt_checksum(bytes, header, 0) != 0)
+  unsigned flags = read16(bytes + 6);
+  if (header < 20 || header > size || total < header || total > size ||
+      (flags & (fragments ? 0x8000u : 0xbfffu)) != 0 ||
+      (fragments && ((flags & 0x3fffu) && ((flags & 0x4000u) || total == header))) ||
+      (fragments && (flags & 0x2000u) && ((total - header) % 8)) ||
+      (fragments && (flags & 0x1fffu) * 8u + total - header > 65515u) || nanoamt_checksum(bytes, header, 0) != 0)
     return 0;
   for (size_t i = 20; i < header;) {
     if (bytes[i] == 0)
@@ -44,13 +48,13 @@ static int ipv4_decode(uint8_t *bytes, size_t size, ip_packet *ip) {
   return 1;
 }
 
-int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip) {
+static int ip_decode(uint8_t *bytes, size_t size, ip_packet *ip, int fragments) {
   memset(ip, 0, sizeof(*ip));
   if (size < 1)
     return 0;
   ip->version = bytes[0] >> 4;
   if (ip->version == 4) {
-    if (!ipv4_decode(bytes, size, ip))
+    if (!ipv4_decode(bytes, size, ip, fragments))
       return 0;
   } else if (ip->version == 6) {
     if (size < 40)
@@ -90,8 +94,15 @@ int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip) {
       next = bytes[at];
       at += length;
     }
-    if (next == 44)
-      return 0;
+    if (next == 44) {
+      if (!fragments || at + 8 > total || bytes[at + 1] || (read16(bytes + at + 2) & 6u) ||
+          ((read16(bytes + at + 2) & 0xfff9u) && total == at + 8) ||
+          (read16(bytes + at + 2) & 0xfff8u) + total - at - 8 > 65535u - (at - 40) ||
+          ((read16(bytes + at + 2) & 1u) && (total - at - 8) % 8))
+        return 0;
+      next = bytes[at];
+      at += 8;
+    }
     ip->size = total;
     ip->payload = bytes + at;
     ip->payload_size = total - at;
@@ -103,6 +114,13 @@ int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip) {
   } else
     return 0;
   return 1;
+}
+
+int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip) {
+  return ip_decode(bytes, size, ip, 0);
+}
+int nanoamt_ip_forward_decode(const uint8_t *bytes, size_t size, ip_packet *ip) {
+  return ip_decode((uint8_t *)bytes, size, ip, 1);
 }
 
 uint32_t nanoamt_pseudo_sum(const ip_packet *ip, uint8_t protocol, size_t size) {
