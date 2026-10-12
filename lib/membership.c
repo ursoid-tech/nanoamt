@@ -97,12 +97,14 @@ nanoamt_memberships *nanoamt_memberships_new(const nanoamt_membership_config *co
     c.max_sources_per_group = c.max_sources < 64 ? c.max_sources : 64;
   if (!c.max_report_records)
     c.max_report_records = 1024;
+  if (!c.max_sources_per_record)
+    c.max_sources_per_record = c.max_sources_per_group;
   if (!c.membership_interval_ms)
     c.membership_interval_ms = 260000;
   if (!c.last_member_time_ms)
     c.last_member_time_ms = 2000;
   if (c.max_groups > 8192 || c.max_sources > 65535 || c.max_sources_per_group > 65535 ||
-      c.max_sources_per_group > c.max_sources || c.max_report_records > 8192 ||
+      c.max_sources_per_group > c.max_sources || c.max_report_records > 8192 || c.max_sources_per_record > 65535 ||
       c.last_member_time_ms > c.membership_interval_ms)
     return NULL;
   nanoamt_memberships *s = calloc(1, sizeof(*s));
@@ -457,6 +459,8 @@ static int parse_report(nanoamt_memberships *s, const uint8_t *bytes, size_t siz
     size_t length = 4 + stride + sources * stride + aux;
     if (length > n - at)
       return NANOAMT_IGNORED;
+    if (sources > s->config.max_sources_per_record)
+      return NANOAMT_RELAY_ERROR_LIMIT;
     int rc = attempt_record(s, version, p + at + 4, p[at], p + at + 4 + stride, sources, 0, limited);
     if (rc)
       return rc;
@@ -471,9 +475,57 @@ static int apply(nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size
   nanoamt_memberships *candidate = nanoamt_memberships_clone(s);
   if (!candidate)
     return NANOAMT_RELAY_ERROR_MEMORY;
+  int endpoint_transaction = !limited && s->config.mode == NANOAMT_MEMBERSHIP_ENDPOINT;
+  if (endpoint_transaction) {
+    size_t wire = size < 65575 ? size : 65575;
+    size_t extra = wire / 8;
+    if (extra > s->config.max_report_records)
+      extra = s->config.max_report_records;
+    unsigned groups = s->config.max_groups + (unsigned)extra;
+    member_group *storage = realloc(candidate->groups, (size_t)groups * sizeof(*storage));
+    if (!storage) {
+      nanoamt_memberships_free(candidate);
+      return NANOAMT_RELAY_ERROR_MEMORY;
+    }
+    candidate->groups = storage;
+    candidate->config.max_groups = groups;
+    candidate->config.max_sources += (unsigned)(wire / ip_address_size(version));
+    candidate->config.max_sources_per_group += (unsigned)(wire / ip_address_size(version));
+  }
   nanoamt_memberships_tick(candidate, now);
   int denied = 0;
   int rc = parse_report(candidate, bytes, size, version, limited ? &denied : NULL);
+  if (!rc && endpoint_transaction) {
+    if (candidate->count > s->config.max_groups || candidate->sources > s->config.max_sources)
+      rc = NANOAMT_RELAY_ERROR_LIMIT;
+    for (size_t i = 0; !rc && i < candidate->count; ++i)
+      if (candidate->groups[i].count > s->config.max_sources_per_group)
+        rc = NANOAMT_RELAY_ERROR_LIMIT;
+    /* Seal the scratch state before exposing it: no enlarged capacity persists
+     * after commit, even when the report briefly joins before withdrawing. */
+    for (size_t i = 0; !rc && i < candidate->count; ++i) {
+      member_group *g = candidate->groups + i;
+      if (!g->count) {
+        free(g->sources);
+        g->sources = NULL;
+      } else if (g->capacity != g->count) {
+        member_source *storage = realloc(g->sources, g->count * sizeof(*storage));
+        if (!storage)
+          rc = NANOAMT_RELAY_ERROR_MEMORY;
+        else
+          g->sources = storage;
+      }
+      g->capacity = g->count;
+    }
+    if (!rc) {
+      member_group *storage = realloc(candidate->groups, (size_t)s->config.max_groups * sizeof(*storage));
+      if (!storage)
+        rc = NANOAMT_RELAY_ERROR_MEMORY;
+      else
+        candidate->groups = storage;
+    }
+    candidate->config = s->config;
+  }
   if (!rc) {
     nanoamt_memberships old = *s;
     *s = *candidate;

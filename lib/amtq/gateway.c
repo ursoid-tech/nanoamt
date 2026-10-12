@@ -16,10 +16,7 @@ struct nanoamtq {
   context contexts[NANOAMTQ_MAX_CONTEXTS];
   nanoamtq_membership desired[NANOAMTQ_MAX_MEMBERSHIPS], sent[NANOAMTQ_MAX_MEMBERSHIPS];
   size_t desired_count, sent_count;
-  uint64_t control_type;
-  size_t control_size, control_target, control_header;
-  uint8_t control_head[16];
-  uint8_t control[1024];
+  amtq_control_reader control;
   amtq_reassembly fragments;
   nanoamt_reassembly *ip_fragments;
   uint8_t message[NANOAMTQ_MAX_DATA_MESSAGE];
@@ -237,23 +234,13 @@ int nanoamtq_send(nanoamtq *g, int64_t now, nanoamtq_control *out) {
   return NANOAMTQ_OK;
 }
 static int settings(nanoamtq *g, const uint8_t *p, size_t n) {
-  if (g->peer_settings || !n)
+  if (g->peer_settings)
     return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
-  size_t at = 0;
-  int modes = 0;
-  while (at < n) {
-    size_t entry = at, check = 0;
-    uint64_t id, value, seen_id, seen_value;
-    if (!amtq_get(p, n, &at, &id) || !amtq_get(p, n, &at, &value) || id == 1)
-      return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
-    while (check < entry) {
-      if (!amtq_get(p, entry, &check, &seen_id) || !amtq_get(p, entry, &check, &seen_value) || seen_id == id)
-        return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
-    }
-    if (id == 0)
-      modes = (value & 1) != 0;
-  }
-  if (!modes)
+  uint64_t modes, preferred;
+  int rc = amtq_settings_decode(p, n, 1, &modes, &preferred);
+  if (rc == NANOAMTQ_ERROR_MEMORY)
+    return protocol(g, NANOAMTQ_CLOSE_INTERNAL);
+  if (rc)
     return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
   g->peer_settings = 1;
   if (g->local_settings)
@@ -314,6 +301,9 @@ static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
     }
   return protocol(g, NANOAMTQ_CLOSE_EXCESSIVE_LOAD);
 }
+static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
+  return handle(context, type, p, n);
+}
 int nanoamtq_receive_control(nanoamtq *g, int64_t now, uint64_t stream, const uint8_t *p, size_t n, int fin) {
   if (!p && n)
     return NANOAMTQ_ERROR_ARGUMENT;
@@ -322,41 +312,11 @@ int nanoamtq_receive_control(nanoamtq *g, int64_t now, uint64_t stream, const ui
     return rc;
   if (stream || fin)
     return protocol(g, NANOAMTQ_CLOSE_CONTROL_STREAM);
-  while (n) {
-    if (!g->control_header) {
-      g->control_head[g->control_size++] = *p++;
-      --n;
-      size_t len, header;
-      rc = amtq_header(g->control_head, g->control_size, &g->control_type, &len, &header);
-      if (rc == NANOAMTQ_INCOMPLETE)
-        continue;
-      if (rc)
-        return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
-      if (g->control_type <= NANOAMTQ_CONTEXT_ACK && len > sizeof(g->control))
-        return protocol(g, g->control_type == NANOAMTQ_SETTINGS      ? NANOAMTQ_CLOSE_SETTINGS
-                           : !g->peer_settings || !g->local_settings ? NANOAMTQ_CLOSE_PROTOCOL
-                           : g->control_type == NANOAMTQ_AMT_CONTROL ? NANOAMTQ_CLOSE_AMT_MESSAGE
-                                                                     : NANOAMTQ_CLOSE_PROTOCOL);
-      g->control_header = header;
-      g->control_target = len;
-      g->control_size = 0;
-    }
-    size_t remaining = g->control_target - g->control_size;
-    size_t take = remaining < n ? remaining : n;
-    if (take && g->control_type <= NANOAMTQ_CONTEXT_ACK)
-      memcpy(g->control + g->control_size, p, take);
-    g->control_size += take;
-    p += take;
-    n -= take;
-    if (g->control_size == g->control_target) {
-      size_t body = g->control_size;
-      g->control_size = g->control_target = g->control_header = 0;
-      rc = handle(g, g->control_type, g->control, body);
-      if (rc)
-        return rc;
-    }
-  }
-  return NANOAMTQ_OK;
+  size_t consumed;
+  rc = amtq_control_feed(&g->control, p, n, &consumed, receive_record, g);
+  if (rc && !g->error)
+    return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
+  return rc;
 }
 static int match_membership(const nanoamtq_membership *m, const uint8_t *source, const uint8_t *group, size_t addr) {
   return !memcmp(m->group, group, addr) && (m->any_source || !memcmp(m->source, source, addr));

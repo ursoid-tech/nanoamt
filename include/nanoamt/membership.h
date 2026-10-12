@@ -23,6 +23,7 @@ typedef struct nanoamt_membership_config {
   unsigned max_sources;            /* total source records; 0: 1024 */
   unsigned max_sources_per_group;  /* 0: min(64, max_sources) */
   unsigned max_report_records;     /* 0: 1024 */
+  unsigned max_sources_per_record; /* 0: max_sources_per_group */
   uint32_t membership_interval_ms; /* router GMI; 0: 260000 */
   uint32_t last_member_time_ms;    /* router LMQT; 0: 2000 */
   uint8_t mode;                    /* router timers, or immediate per-connection endpoint state */
@@ -38,6 +39,8 @@ typedef struct nanoamt_membership_filter {
 /* Single-threaded objects. Monotonic nonnegative caller clock, below INT64_MAX.
  * apply validates a complete encapsulated IGMP/MLD report before committing.
  * Malformed reports return IGNORED; resource errors leave the object unchanged.
+ * Endpoint transactions enforce state limits on the final result, reserving
+ * temporary scratch bounded by the wire report size. Record limits are hard.
  * Router mode implements RFC 3376/3810 timers without generating queries,
  * as permitted for AMT. Endpoint mode has no autonomous expiry.
  */
