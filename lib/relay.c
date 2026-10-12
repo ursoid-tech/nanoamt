@@ -10,7 +10,14 @@ typedef struct relay_client {
   int64_t until;
   uint32_t mtu;
   uint8_t ecn[2];
+  size_t index_entries;
+  int timer_pending;
 } relay_client;
+typedef struct fanout_entry {
+  uint8_t group[16], source[16], version, wildcard;
+  uint16_t client;
+  uint32_t next;
+} fanout_entry;
 struct nanoamt_relay {
   nanoamt_relay_config config;
   relay_client *clients;
@@ -19,6 +26,12 @@ struct nanoamt_relay {
   int have_previous, error;
   int64_t now, rotate_at, previous_until;
   uint64_t last_id;
+  fanout_entry *index;
+  uint32_t *buckets;
+  uint8_t (*index_sources)[16];
+  size_t index_capacity, bucket_count, source_capacity;
+  int index_dirty;
+  int64_t membership_at;
 };
 static int64_t after(int64_t now, uint32_t delay) {
   return now > INT64_MAX - delay ? INT64_MAX : now + delay;
@@ -38,9 +51,64 @@ static relay_client *find_client(const nanoamt_relay *r, const nanoamt_endpoint 
       return r->clients + i;
   return NULL;
 }
+static size_t index_size(const nanoamt_memberships *state) {
+  size_t count = 0;
+  for (size_t i = 0; i < nanoamt_memberships_count(state); ++i) {
+    nanoamt_membership_filter f;
+    (void)nanoamt_memberships_get(state, i, &f, NULL, 0);
+    count += f.exclude ? 1 : f.source_count;
+  }
+  return count;
+}
+/* Reserve all allocation before the native transaction; rebuild itself cannot
+ * fail due to allocation after the corresponding membership commit. */
+static int index_reserve(nanoamt_relay *r, size_t needed) {
+  if (needed > r->config.max_fanout_entries)
+    return NANOAMT_RELAY_ERROR_LIMIT;
+  if (needed <= r->index_capacity)
+    return NANOAMT_OK;
+  size_t capacity = r->index_capacity ? r->index_capacity : 16;
+  while (capacity < needed)
+    capacity *= 2;
+  if (capacity > r->config.max_fanout_entries)
+    capacity = r->config.max_fanout_entries;
+  size_t buckets = 32;
+  while (buckets < capacity * 2)
+    buckets *= 2;
+  fanout_entry *index = malloc(capacity * sizeof(*index));
+  uint32_t *heads = malloc(buckets * sizeof(*heads));
+  if (!index || !heads) {
+    free(index);
+    free(heads);
+    return NANOAMT_RELAY_ERROR_MEMORY;
+  }
+  free(r->index);
+  free(r->buckets);
+  r->index = index;
+  r->buckets = heads;
+  r->index_capacity = capacity;
+  r->bucket_count = buckets;
+  r->index_dirty = 1;
+  return NANOAMT_OK;
+}
+static void timers(nanoamt_relay *r) {
+  r->membership_at = INT64_MAX;
+  for (size_t i = 0; i < r->config.max_clients; ++i) {
+    const relay_client *c = r->clients + i;
+    if (!c->id)
+      continue;
+    if (c->until < r->membership_at)
+      r->membership_at = c->until;
+    int64_t at = nanoamt_memberships_next_timeout(c->requested);
+    if (at < r->membership_at)
+      r->membership_at = at;
+  }
+}
 static void delete_client(nanoamt_relay *r, relay_client *c) {
   nanoamt_memberships_free(c->requested);
   nanoamt_memberships_free(c->authorized);
+  r->stats.fanout_entries -= c->index_entries;
+  r->index_dirty = 1;
   memset(c, 0, sizeof(*c));
   --r->stats.clients;
 }
@@ -62,6 +130,8 @@ nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now
   nanoamt_relay_config c = *config;
   if (!c.max_clients)
     c.max_clients = 64;
+  if (!c.max_fanout_entries)
+    c.max_fanout_entries = 65536;
   if (!c.max_clients_per_ip)
     c.max_clients_per_ip = c.max_clients < 16 ? c.max_clients : 16;
   if (!c.query_interval_ms)
@@ -76,9 +146,10 @@ nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now
     c.path_mtu = 1500;
   if (!c.minimum_path_mtu)
     c.minimum_path_mtu = 576;
-  if (c.max_clients > 1024 || c.max_clients_per_ip > c.max_clients || c.robustness > 7 || c.query_response_ms < 10000 ||
-      c.query_response_ms > 3174400 || c.query_interval_ms > 31744000 || c.query_interval_ms <= c.query_response_ms ||
-      c.path_mtu > 65535 || c.minimum_path_mtu < 68 || c.path_mtu < c.minimum_path_mtu || c.path_mtu < 1280 ||
+  if (c.max_fanout_entries > 1048576 || c.max_clients > 1024 || c.max_clients_per_ip > c.max_clients ||
+      c.robustness > 7 || c.query_response_ms < 10000 || c.query_response_ms > 3174400 ||
+      c.query_interval_ms > 31744000 || c.query_interval_ms <= c.query_response_ms || c.path_mtu > 65535 ||
+      c.minimum_path_mtu < 68 || c.path_mtu < c.minimum_path_mtu || c.path_mtu < 1280 ||
       (!zero(c.advertised4.ip, 4) && !address_unicast(c.advertised4.ip, 4)) ||
       (!zero(c.advertised6.ip, 16) && !address_unicast(c.advertised6.ip, 6)) ||
       (!zero(c.query_source4, 4) && !address_unicast(c.query_source4, 4)) ||
@@ -118,9 +189,16 @@ nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now
   r->config = c;
   r->qqic = (uint8_t)qqic;
   r->now = now;
+  r->membership_at = INT64_MAX;
+  r->source_capacity = c.memberships.max_sources_per_group;
+  if (!r->source_capacity) {
+    unsigned sources = c.memberships.max_sources ? c.memberships.max_sources : 1024;
+    r->source_capacity = sources < 64 ? sources : 64;
+  }
+  r->index_sources = malloc(r->source_capacity * sizeof(*r->index_sources));
   r->rotate_at = after(now, c.secret_interval_ms);
   r->clients = calloc(c.max_clients, sizeof(*r->clients));
-  if (!r->clients || c.random_bytes(c.random_context, r->secret, sizeof(r->secret))) {
+  if (!r->index_sources || !r->clients || c.random_bytes(c.random_context, r->secret, sizeof(r->secret))) {
     nanoamt_relay_free(r);
     return NULL;
   }
@@ -133,6 +211,9 @@ void nanoamt_relay_free(nanoamt_relay *r) {
         if (r->clients[i].id)
           delete_client(r, r->clients + i);
     free(r->clients);
+    free(r->index_sources);
+    free(r->index);
+    free(r->buckets);
     /* Do not leave long-lived cookie keys in a reusable heap block. */
     wipe(r->secret, sizeof(r->secret));
     wipe(r->previous, sizeof(r->previous));
@@ -162,6 +243,9 @@ int nanoamt_relay_tick(nanoamt_relay *r, int64_t now) {
     r->have_previous = 0;
     wipe(r->previous, sizeof(r->previous));
   }
+  if (now < r->membership_at)
+    return NANOAMT_OK;
+  ++r->stats.timer_scans;
   for (size_t i = 0; i < r->config.max_clients; ++i) {
     relay_client *c = r->clients + i;
     if (!c->id)
@@ -171,7 +255,8 @@ int nanoamt_relay_tick(nanoamt_relay *r, int64_t now) {
       ++r->stats.expired;
       continue;
     }
-    int due = now >= nanoamt_memberships_next_timeout(c->requested);
+    int due = c->timer_pending || now >= nanoamt_memberships_next_timeout(c->requested);
+    c->timer_pending = due;
     nanoamt_memberships_tick(c->requested, now);
     nanoamt_memberships_tick(c->authorized, now);
     if (due) {
@@ -185,10 +270,31 @@ int nanoamt_relay_tick(nanoamt_relay *r, int64_t now) {
       }
       if (rc)
         return rc;
+      size_t count = index_size(intersection), others = r->stats.fanout_entries - c->index_entries;
+      if (count > r->config.max_fanout_entries - others) {
+        nanoamt_memberships_free(intersection);
+        nanoamt_membership_config empty = r->config.memberships;
+        empty.mode = NANOAMT_MEMBERSHIP_ENDPOINT;
+        intersection = nanoamt_memberships_new(&empty, now);
+        if (!intersection)
+          return NANOAMT_RELAY_ERROR_MEMORY;
+        count = 0;
+        ++r->stats.limited;
+      }
+      rc = index_reserve(r, others + count);
+      if (rc) {
+        nanoamt_memberships_free(intersection);
+        return rc;
+      }
       nanoamt_memberships_free(c->authorized);
       c->authorized = intersection;
+      r->stats.fanout_entries = others + count;
+      c->index_entries = count;
+      c->timer_pending = 0;
+      r->index_dirty = 1;
     }
   }
+  timers(r);
   return NANOAMT_OK;
 }
 int64_t nanoamt_relay_next_timeout(const nanoamt_relay *r) {
@@ -197,16 +303,8 @@ int64_t nanoamt_relay_next_timeout(const nanoamt_relay *r) {
   int64_t next = r->rotate_at;
   if (r->have_previous && r->previous_until < next)
     next = r->previous_until;
-  for (size_t i = 0; i < r->config.max_clients; ++i) {
-    const relay_client *c = r->clients + i;
-    if (!c->id)
-      continue;
-    if (c->until < next)
-      next = c->until;
-    int64_t timeout = nanoamt_memberships_next_timeout(c->requested);
-    if (timeout < next)
-      next = timeout;
-  }
+  if (r->membership_at < next)
+    next = r->membership_at;
   return next;
 }
 static int mac(nanoamt_relay *r, const uint8_t key[32], const nanoamt_endpoint *peer, const uint8_t nonce[4],
@@ -260,6 +358,9 @@ static int aggregate(nanoamt_relay *r, const relay_client *replace, const nanoam
       state = candidate;
     if (!state)
       continue;
+    /* Data-path ticks skip non-due clients; algebra needs matching clocks. */
+    if (c && c != replace && c->id)
+      nanoamt_memberships_tick(c->authorized, r->now);
     nanoamt_memberships *merged = NULL;
     int rc = nanoamt_memberships_union(*output, state, &merged);
     if (rc) {
@@ -290,6 +391,10 @@ static int update(nanoamt_relay *r, const nanoamt_endpoint *peer, const nanoamt_
   if (rc)
     return rc;
   relay_client *c = find_client(r, peer, local);
+  if (c) {
+    nanoamt_memberships_tick(c->requested, r->now);
+    nanoamt_memberships_tick(c->authorized, r->now);
+  }
   nanoamt_memberships *candidate =
       c ? nanoamt_memberships_clone(c->requested) : nanoamt_memberships_new(&r->config.memberships, r->now);
   if (!candidate)
@@ -362,6 +467,29 @@ static int update(nanoamt_relay *r, const nanoamt_endpoint *peer, const nanoamt_
     nanoamt_memberships_free(candidate);
     return rc;
   }
+  size_t others = r->stats.fanout_entries - c->index_entries;
+  size_t admitted = authorized ? index_size(authorized) : 0, keeping = index_size(retained);
+  if (admitted > r->config.max_fanout_entries - others) {
+    denied = 1;
+    ++r->stats.limited;
+  }
+  if (keeping > r->config.max_fanout_entries - others) {
+    nanoamt_memberships_free(retained);
+    retained = nanoamt_memberships_new(&empty_config, r->now);
+    if (!retained)
+      rc = NANOAMT_RELAY_ERROR_MEMORY;
+    keeping = 0;
+    ++r->stats.limited;
+  }
+  if (!rc)
+    rc = index_reserve(r, others + (denied ? keeping : admitted > keeping ? admitted : keeping));
+  if (rc) {
+    nanoamt_memberships_free(merged);
+    nanoamt_memberships_free(authorized);
+    nanoamt_memberships_free(retained);
+    nanoamt_memberships_free(candidate);
+    return rc;
+  }
   if (!denied && r->config.authorize)
     denied = r->config.authorize(r->config.authorize_context, peer, candidate, merged) != 0;
   nanoamt_memberships_free(merged);
@@ -382,9 +510,13 @@ static int update(nanoamt_relay *r, const nanoamt_endpoint *peer, const nanoamt_
   nanoamt_memberships_free(c->authorized);
   c->requested = candidate;
   c->authorized = authorized;
+  c->index_entries = denied ? keeping : admitted;
+  r->stats.fanout_entries = others + c->index_entries;
+  r->index_dirty = 1;
   c->until = after(r->now, r->config.memberships.membership_interval_ms);
   c->ecn[version == 6] = (uint8_t)ecn;
   ++r->stats.updates;
+  timers(r);
   return NANOAMT_OK;
 }
 int nanoamt_relay_receive(nanoamt_relay *r, int64_t now, const nanoamt_endpoint *peer, const nanoamt_endpoint *local,
@@ -418,6 +550,7 @@ int nanoamt_relay_receive(nanoamt_relay *r, int64_t now, const nanoamt_endpoint 
     for (size_t i = 0; i < r->config.max_clients; ++i)
       if (r->clients[i].id && endpoint_equal(&r->clients[i].peer, &old))
         delete_client(r, r->clients + i);
+    timers(r);
     ++r->stats.teardowns;
     return NANOAMT_OK;
   }
@@ -493,6 +626,82 @@ static int forwardable(const ip_packet *ip) {
 static int mtu_blocked(const uint8_t *bytes, const ip_packet *ip, uint32_t mtu) {
   return ip->size > mtu && (ip->version == 6 || (read16(bytes + 6) & 0x4000u) || mtu < (bytes[0] & 15u) * 4u + 8u);
 }
+static size_t index_hash(unsigned version, const uint8_t *group, const uint8_t *source, size_t mask) {
+  uint64_t h = UINT64_C(14695981039346656037) ^ version;
+  size_t n = ip_address_size(version);
+  for (size_t i = 0; i < n; ++i)
+    h = (h ^ group[i]) * UINT64_C(1099511628211);
+  for (size_t i = 0; i < n; ++i)
+    h = (h ^ (source ? source[i] : 0)) * UINT64_C(1099511628211);
+  return (size_t)(h ^ (h >> 32)) & mask;
+}
+static int index_rebuild(nanoamt_relay *r) {
+  if (!r->index_dirty)
+    return NANOAMT_OK;
+  if (r->bucket_count)
+    memset(r->buckets, 0, r->bucket_count * sizeof(*r->buckets));
+  size_t at = 0;
+  for (size_t i = 0; i < r->config.max_clients; ++i) {
+    relay_client *c = r->clients + i;
+    if (!c->id)
+      continue;
+    for (size_t j = 0; j < nanoamt_memberships_count(c->authorized); ++j) {
+      nanoamt_membership_filter filter;
+      int rc = nanoamt_memberships_get(c->authorized, j, &filter, r->index_sources, r->source_capacity);
+      if (rc)
+        return rc;
+      size_t count = filter.exclude ? 1 : filter.source_count;
+      for (size_t k = 0; k < count; ++k) {
+        if (at == r->index_capacity)
+          return NANOAMT_RELAY_ERROR_LIMIT;
+        fanout_entry *entry = r->index + at;
+        memset(entry, 0, sizeof(*entry));
+        entry->client = (uint16_t)i;
+        entry->version = filter.ip_version;
+        entry->wildcard = filter.exclude;
+        memcpy(entry->group, filter.group, 16);
+        if (!filter.exclude)
+          memcpy(entry->source, r->index_sources[k], 16);
+        size_t hash =
+            index_hash(entry->version, entry->group, entry->wildcard ? NULL : entry->source, r->bucket_count - 1);
+        entry->next = r->buckets[hash];
+        r->buckets[hash] = (uint32_t)++at;
+      }
+    }
+  }
+  r->index_dirty = 0;
+  ++r->stats.fanout_rebuilds;
+  return NANOAMT_OK;
+}
+static void index_candidates(nanoamt_relay *r, const ip_packet *ip, uint8_t *eligible, int wildcard) {
+  if (!r->bucket_count)
+    return;
+  size_t hash = index_hash(ip->version, ip->destination, wildcard ? NULL : ip->source, r->bucket_count - 1);
+  for (uint32_t at = r->buckets[hash]; at; at = r->index[at - 1].next) {
+    const fanout_entry *entry = r->index + at - 1;
+    ++r->stats.fanout_candidates;
+    if (entry->version != ip->version || entry->wildcard != wildcard ||
+        memcmp(entry->group, ip->destination, ip_address_size(ip->version)) ||
+        (!wildcard && memcmp(entry->source, ip->source, ip_address_size(ip->version))))
+      continue;
+    size_t i = entry->client;
+    if (allowed(r->clients + i, ip))
+      eligible[i / 8] |= (uint8_t)(1u << (i % 8));
+  }
+}
+static size_t eligible_next(const nanoamt_relay_forward *f, size_t start, size_t limit) {
+  while (start < limit) {
+    uint8_t bits = (uint8_t)(f->eligible[start / 8] & (uint8_t)(255u << (start % 8)));
+    if (!bits) {
+      start = (start / 8 + 1) * 8;
+      continue;
+    }
+    while (!(bits & (1u << (start % 8))))
+      ++start;
+    return start < limit ? start : limit;
+  }
+  return limit;
+}
 int nanoamt_relay_forward_begin(nanoamt_relay *r, int64_t now, const uint8_t *bytes, size_t size,
                                 nanoamt_relay_forward *f) {
   if (!f || (!bytes && size))
@@ -508,11 +717,14 @@ int nanoamt_relay_forward_begin(nanoamt_relay *r, int64_t now, const uint8_t *by
   f->ip = bytes;
   f->size = size;
   f->max_tunnel_id = r->last_id;
-  for (size_t i = 0; i < r->config.max_clients; ++i) {
+  rc = index_rebuild(r);
+  if (rc)
+    return rc;
+  index_candidates(r, &ip, f->eligible, 0);
+  index_candidates(r, &ip, f->eligible, 1);
+  for (size_t i = eligible_next(f, 0, r->config.max_clients); i < r->config.max_clients;
+       i = eligible_next(f, i + 1, r->config.max_clients)) {
     relay_client *c = r->clients + i;
-    if (!allowed(c, &ip))
-      continue;
-    f->eligible[i / 8] |= (uint8_t)(1u << (i % 8));
     uint32_t mtu = tunnel_mtu(c);
     if (mtu_blocked(bytes, &ip, mtu)) {
       ++r->stats.mtu_drops;
@@ -561,7 +773,8 @@ int nanoamt_relay_forward_next(nanoamt_relay *r, int64_t now, nanoamt_relay_forw
     /* Recompute at emission: a leave or PMTU change can occur while the
      * caller retains a cursor or a previous output under backpressure. */
     f->feedback_mtu = 0;
-    for (size_t i = f->client; i < r->config.max_clients; ++i) {
+    for (size_t i = eligible_next(f, f->client, r->config.max_clients); i < r->config.max_clients;
+         i = eligible_next(f, i + 1, r->config.max_clients)) {
       relay_client *c = r->clients + i;
       if (!(f->eligible[i / 8] & (1u << (i % 8))) || c->id > f->max_tunnel_id || !allowed(c, &ip))
         continue;
@@ -583,7 +796,7 @@ int nanoamt_relay_forward_next(nanoamt_relay *r, int64_t now, nanoamt_relay_forw
     f->feedback_done = 1;
     return NANOAMT_PACKET;
   }
-  while (f->client < r->config.max_clients) {
+  while ((f->client = eligible_next(f, f->client, r->config.max_clients)) < r->config.max_clients) {
     relay_client *c = r->clients + f->client;
     uint32_t mtu = tunnel_mtu(c);
     if (!(f->eligible[f->client / 8] & (1u << (f->client % 8))) || c->id > f->max_tunnel_id || !allowed(c, &ip) ||
@@ -634,6 +847,7 @@ int nanoamt_relay_forward_next(nanoamt_relay *r, int64_t now, nanoamt_relay_forw
     out->source = c->local;
     out->destination = c->peer;
     out->tunnel_id = c->id;
+    out->client_slot = (uint16_t)f->client;
     out->size = produced + 2;
     out->tos = c->ecn[ip.version == 6] ? ip.tos & 3u : 0;
     out->dont_fragment = 1;
@@ -656,11 +870,12 @@ int nanoamt_relay_output_valid(nanoamt_relay *r, int64_t now, const nanoamt_rela
     return 0;
   if (nanoamt_relay_tick(r, now))
     return 0;
-  relay_client *c = find_client(r, &out->destination, &out->source);
+  relay_client *c = out->client_slot < r->config.max_clients ? r->clients + out->client_slot : NULL;
   ip_packet ip;
-  return c && c->id == out->tunnel_id && c->local.scope_id == out->source.scope_id && size - 2 <= tunnel_mtu(c) &&
-         nanoamt_ip_forward_decode(bytes + 2, size - 2, &ip) && ip.size == size - 2 && allowed(c, &ip) &&
-         out->tos == (c->ecn[ip.version == 6] ? ip.tos & 3u : 0);
+  return c && c->id && c->id == out->tunnel_id && endpoint_equal(&c->peer, &out->destination) &&
+         endpoint_equal(&c->local, &out->source) && c->local.scope_id == out->source.scope_id &&
+         size - 2 <= tunnel_mtu(c) && nanoamt_ip_forward_decode(bytes + 2, size - 2, &ip) && ip.size == size - 2 &&
+         allowed(c, &ip) && out->tos == (c->ecn[ip.version == 6] ? ip.tos & 3u : 0);
 }
 void nanoamt_relay_get_stats(const nanoamt_relay *r, nanoamt_relay_stats *out) {
   if (out) {

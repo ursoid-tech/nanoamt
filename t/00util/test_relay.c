@@ -144,6 +144,9 @@ static void fanout(void) {
   CHECK(out.size == n + 2);
   CHECK(nanoamt_relay_forward_next(r, 0, &cursor, bytes, sizeof(bytes), &out) == NANOAMT_PACKET);
   pending = out;
+  nanoamt_relay_output wrong_slot = out;
+  wrong_slot.client_slot = (uint16_t)((out.client_slot + 1) % 64);
+  CHECK(!nanoamt_relay_output_valid(r, 0, &wrong_slot, bytes, out.size));
   memcpy(queued, bytes, out.size);
   nanoamt *leaver = out.destination.port == a.port ? ga : gb;
   nanoamt_endpoint leaving_peer = out.destination.port == a.port ? a : b;
@@ -159,6 +162,10 @@ static void fanout(void) {
   CHECK(!nanoamt_relay_snapshot(r, 1, &snapshot));
   CHECK(nanoamt_memberships_count(snapshot) == 1);
   nanoamt_memberships_free(snapshot);
+  /* Reusing the departed slot must not revive retained bytes from its old tunnel. */
+  nanoamt *replacement = join(r, &config, &leaving_peer, 2, &report);
+  CHECK(!nanoamt_relay_output_valid(r, 2, &pending, queued, pending.size));
+  nanoamt_free(replacement);
   nanoamt_free(ga);
   nanoamt_free(gb);
   nanoamt_relay_free(r);
@@ -460,6 +467,166 @@ static void interface_refresh(void) {
     nanoamt_relay_free(r);
   }
 }
+
+static nanoamt_relay *indexed_relay(unsigned *random, unsigned clients, unsigned entries) {
+  nanoamt_relay_config c = {0};
+  c.random_bytes = fixture_random;
+  c.random_context = random;
+  c.response_mac = test_mac;
+  c.max_clients = c.max_clients_per_ip = clients;
+  c.max_fanout_entries = entries;
+  nanoamt_relay *r = nanoamt_relay_new(&c, 0);
+  CHECK(r);
+  return r;
+}
+static unsigned destinations(nanoamt_relay *r, int64_t now, const nanoamt_config *config, uint16_t *ports) {
+  uint8_t ip[128], bytes[128];
+  size_t n = data(ip, config, 5);
+  nanoamt_relay_forward f;
+  nanoamt_relay_output out;
+  CHECK(!nanoamt_relay_forward_begin(r, now, ip, n, &f));
+  unsigned count = 0;
+  int rc;
+  while ((rc = nanoamt_relay_forward_next(r, now, &f, bytes, sizeof(bytes), &out)) == NANOAMT_PACKET) {
+    CHECK(count < 1024 && out.kind == NANOAMT_RELAY_DATA);
+    CHECK(nanoamt_relay_output_valid(r, now, &out, bytes, out.size));
+    if (ports)
+      ports[count] = out.destination.port;
+    ++count;
+  }
+  CHECK(!rc);
+  return count;
+}
+static void rewrite_report(nanoamt_datagram *report, unsigned type, const uint8_t *sources, unsigned count) {
+  /* Independent IPv4 IGMPv3 record mutation; retain authenticated AMT cookie. */
+  CHECK(count <= 8 && report->bytes[12] == 0x46);
+  uint8_t *igmp = report->bytes + 36;
+  igmp[2] = igmp[3] = 0;
+  put16(igmp + 6, 1);
+  igmp[8] = (uint8_t)type;
+  igmp[9] = 0;
+  put16(igmp + 10, count);
+  if (count)
+    memcpy(igmp + 16, sources, 4 * count);
+  report->size = 52 + 4 * count;
+  put16(report->bytes + 14, (unsigned)(report->size - 12));
+  ip_checksum(report->bytes + 12);
+  put16(igmp + 2, sum16(igmp, 16 + 4 * count));
+}
+static void indexed_scale(void) {
+  unsigned random = 0;
+  nanoamt_relay *r = indexed_relay(&random, 1024, 1024);
+  nanoamt_config target = fixture_config(&random);
+  target.group[3] = 7;
+  target.source[3] = 15;
+  nanoamt *gateways[1024];
+  nanoamt_endpoint peers[1024];
+  nanoamt_datagram report;
+  for (unsigned i = 0; i < 1024; ++i) {
+    nanoamt_config c = fixture_config(&random);
+    c.group[3] = (uint8_t)(i < 992 ? 9 : 7);
+    if (i >= 992)
+      c.source[3] = (uint8_t)(i - 992 + 1);
+    if (i == 1023)
+      c.any_source = 1;
+    peers[i] = peer_for(&c, 40000 + i);
+    gateways[i] = join(r, &c, peers + i, 0, &report);
+  }
+  uint16_t ports[1024];
+  nanoamt_relay_stats before, after;
+  CHECK(destinations(r, 0, &target, ports) == 2);
+  CHECK((ports[0] == 41006 && ports[1] == 41023) || (ports[1] == 41006 && ports[0] == 41023));
+  nanoamt_relay_get_stats(r, &before);
+  CHECK(before.clients == 1024 && before.fanout_entries == 1024 && before.fanout_rebuilds == 1);
+  for (unsigned i = 1; i <= 200; ++i)
+    CHECK(destinations(r, i, &target, ports) == 2);
+  nanoamt_relay_get_stats(r, &after);
+  CHECK(after.fanout_rebuilds == before.fanout_rebuilds && after.timer_scans == before.timer_scans);
+  CHECK(after.fanout_candidates - before.fanout_candidates < 200 * 32);
+  /* Filter churn changes only the next indexed snapshot, never resurrecting a queued output. */
+  uint8_t ip[128], bytes[128];
+  size_t n = data(ip, &target, 5);
+  nanoamt_relay_forward cursor;
+  nanoamt_relay_output out;
+  nanoamt_relay_control control;
+  CHECK(!nanoamt_relay_forward_begin(r, 201, ip, n, &cursor));
+  CHECK(nanoamt_relay_forward_next(r, 201, &cursor, bytes, sizeof(bytes), &out) == NANOAMT_PACKET);
+  unsigned departed = (unsigned)out.destination.port - 40000;
+  CHECK(!nanoamt_leave(gateways[departed], 201));
+  CHECK(nanoamt_send(gateways[departed], 201, &report) == NANOAMT_PACKET);
+  CHECK(!nanoamt_relay_receive(r, 201, peers + departed, &target.discovery, report.bytes, report.size, &control));
+  CHECK(!nanoamt_relay_output_valid(r, 201, &out, bytes, out.size));
+  CHECK(destinations(r, 201, &target, ports) == 1);
+  nanoamt_relay_get_stats(r, &after);
+  CHECK(after.fanout_rebuilds == 2 && after.fanout_entries == 1023);
+  CHECK(!nanoamt_relay_tick(r, 260000));
+  CHECK(destinations(r, 260000, &target, ports) == 0);
+  nanoamt_relay_get_stats(r, &after);
+  CHECK(!after.clients && !after.fanout_entries && after.timer_scans == 1);
+  fprintf(stderr, "indexed scale: clients=1024 packets=201 candidates=%llu timer-scans=%llu\n",
+          (unsigned long long)(after.fanout_candidates - before.fanout_candidates),
+          (unsigned long long)after.timer_scans);
+  for (unsigned i = 0; i < 1024; ++i)
+    nanoamt_free(gateways[i]);
+  nanoamt_relay_free(r);
+}
+static void indexed_churn(void) {
+  unsigned random = 0;
+  nanoamt_relay *r = indexed_relay(&random, 3, 2);
+  nanoamt_config c[3];
+  nanoamt *g[3];
+  nanoamt_endpoint peers[3];
+  nanoamt_datagram reports[3];
+  for (unsigned i = 0; i < 3; ++i) {
+    c[i] = fixture_config(&random);
+    c[i].source[3] = (uint8_t)(10 + i);
+    peers[i] = peer_for(c + i, 40000 + i);
+    g[i] = join(r, c + i, peers + i, 0, reports + i);
+  }
+  CHECK(destinations(r, 0, c, NULL) == 1 && destinations(r, 0, c + 1, NULL) == 1);
+  CHECK(destinations(r, 0, c + 2, NULL) == 0);
+  nanoamt_relay_stats stats;
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(stats.fanout_entries == 2 && stats.denied == 1 && stats.limited == 1);
+  nanoamt_relay_control out;
+  uint8_t two_sources[8];
+  memcpy(two_sources, c[0].source, 4);
+  memcpy(two_sources + 4, c[2].source, 4);
+  rewrite_report(reports, 1, two_sources, 2);
+  CHECK(!nanoamt_relay_receive(r, 1, peers, &c[0].discovery, reports[0].bytes, reports[0].size, &out));
+  CHECK(destinations(r, 1, c, NULL) == 1 && destinations(r, 1, c + 2, NULL) == 0);
+  /* A source withdrawal shortens its timer even while index additions are denied. */
+  rewrite_report(reports, 3, NULL, 0);
+  CHECK(!nanoamt_relay_receive(r, 2, peers, &c[0].discovery, reports[0].bytes, reports[0].size, &out));
+  CHECK(nanoamt_relay_next_timeout(r) == 2002);
+  CHECK(destinations(r, 2001, c, NULL) == 1);
+  uint8_t ip[128], bytes[128];
+  size_t n = data(ip, c, 5);
+  nanoamt_relay_forward cursor;
+  nanoamt_relay_output queued;
+  CHECK(!nanoamt_relay_forward_begin(r, 2001, ip, n, &cursor));
+  CHECK(nanoamt_relay_forward_next(r, 2001, &cursor, bytes, sizeof(bytes), &queued) == NANOAMT_PACKET);
+  CHECK(destinations(r, 2002, c, NULL) == 0);
+  CHECK(!nanoamt_relay_output_valid(r, 2002, &queued, bytes, queued.size));
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(stats.fanout_entries == 1 && stats.timer_scans == 1);
+  CHECK(!nanoamt_relay_receive(r, 2002, peers + 2, &c[2].discovery, reports[2].bytes, reports[2].size, &out));
+  CHECK(destinations(r, 2002, c + 2, NULL) == 1);
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(stats.fanout_entries == 2);
+  /* INCLUDE -> EXCLUDE switches to a wildcard bucket, retaining source checks. */
+  rewrite_report(reports + 1, 2, c[0].source, 1);
+  CHECK(!nanoamt_relay_receive(r, 2003, peers + 1, &c[1].discovery, reports[1].bytes, reports[1].size, &out));
+  CHECK(destinations(r, 2003, c, NULL) == 0);
+  CHECK(destinations(r, 2003, c + 1, NULL) == 1);
+  CHECK(destinations(r, 2003, c + 2, NULL) == 2);
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(stats.fanout_entries == 2);
+  for (unsigned i = 0; i < 3; ++i)
+    nanoamt_free(g[i]);
+  nanoamt_relay_free(r);
+}
+
 int main(int argc, char **argv) {
   CHECK(argc == 2);
   if (!strcmp(argv[1], "exchange"))
@@ -476,6 +643,10 @@ int main(int argc, char **argv) {
     policy();
   else if (!strcmp(argv[1], "expiry"))
     expiry();
+  else if (!strcmp(argv[1], "indexed-scale"))
+    indexed_scale();
+  else if (!strcmp(argv[1], "indexed-churn"))
+    indexed_churn();
   else if (!strcmp(argv[1], "interface-refresh"))
     interface_refresh();
   else
