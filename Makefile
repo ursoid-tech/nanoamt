@@ -41,7 +41,7 @@ ifeq ($(NANOAMT_BUILD_POSIX),1)
 TARGETS += $(POSIX_LIB) $(BUILD_DIR)/nanoamt-recv
 TEST_BINS += $(TEST_DIR)/test-posix
 ifeq ($(SYSTEM),Linux)
-TEST_BINS += $(TEST_DIR)/test-kernel
+TEST_BINS += $(TEST_DIR)/test-kernel $(TEST_DIR)/test-relay-posix
 endif
 endif
 FUZZ_FLAGS = -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
@@ -49,8 +49,8 @@ FUZZ_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/
 AMTQ_FUZZ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/amtq.o
 AMTQ_RELAY_FUZZ_OBJECTS = $(AMTQ_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/amtq_relay.o
 RELAY_FUZZ_OBJECTS = $(CORE_SOURCES:%.c=$(BUILD_DIR)/fuzz/%.o) $(BUILD_DIR)/fuzz/fuzz/relay.o
-OBJECTS = $(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/lib/openssl.o $(BUILD_DIR)/examples/recv.o \
-          $(addprefix $(TEST_DIR)/,test_gateway.o test_rfc.o test_membership.o test_relay.o test_openssl.o test_posix.o test_kernel.o test_amtq.o test_amtq_relay.o) $(FUZZ_OBJECTS) $(AMTQ_FUZZ_OBJECTS) $(AMTQ_RELAY_FUZZ_OBJECTS) $(RELAY_FUZZ_OBJECTS)
+OBJECTS = $(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/lib/relay_posix.o $(BUILD_DIR)/lib/openssl.o $(BUILD_DIR)/examples/recv.o \
+          $(addprefix $(TEST_DIR)/,test_gateway.o test_rfc.o test_membership.o test_relay.o test_openssl.o test_posix.o test_relay_posix.o test_kernel.o test_amtq.o test_amtq_relay.o) $(FUZZ_OBJECTS) $(AMTQ_FUZZ_OBJECTS) $(AMTQ_RELAY_FUZZ_OBJECTS) $(RELAY_FUZZ_OBJECTS)
 
 .PHONY: all check sanitize fuzz fuzz-amtq fuzz-amtq-relay fuzz-relay install clean indent
 .DELETE_ON_ERROR:
@@ -60,13 +60,13 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p "$(@D)"
 	$(CC) $(CPPFLAGS) -Iinclude $(CFLAGS) -std=c99 $(NANOAMT_WARNFLAGS) -MMD -MP -c $< -o $@
 
-$(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/lib/openssl.o: NANOAMT_WARNFLAGS = $(WARNFLAGS)
+$(CORE_OBJECTS) $(AMTQ_OBJECTS) $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/lib/relay_posix.o $(BUILD_DIR)/lib/openssl.o: NANOAMT_WARNFLAGS = $(WARNFLAGS)
 
 $(CORE_LIB): $(CORE_OBJECTS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
-$(POSIX_LIB): $(BUILD_DIR)/lib/posix.o
+$(POSIX_LIB): $(BUILD_DIR)/lib/posix.o $(BUILD_DIR)/lib/relay_posix.o
 	rm -f $@
 	$(AR) rcs $@ $^
 
@@ -103,6 +103,9 @@ $(TEST_DIR)/test-openssl: $(TEST_DIR)/test_openssl.o $(OPENSSL_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS) -lcrypto
 
 $(TEST_DIR)/test-posix $(TEST_DIR)/test-kernel: $(TEST_DIR)/test-%: $(TEST_DIR)/test_%.o $(POSIX_LIB) $(CORE_LIB)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_DIR)/test-relay-posix: $(TEST_DIR)/test_relay_posix.o $(POSIX_LIB) $(CORE_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 check: all $(TEST_BINS)
@@ -161,11 +164,12 @@ ifeq ($(NANOAMT_BUILD_POSIX),1)
 	$(INSTALL) -d "$(DESTDIR)$(INCLUDEDIR)/nanoamt"
 	$(INSTALL) -m 644 $(POSIX_LIB) "$(DESTDIR)$(LIBDIR)/libnanoamt-posix.a"
 	$(INSTALL) -m 644 include/nanoamt/posix.h "$(DESTDIR)$(INCLUDEDIR)/nanoamt/posix.h"
+	$(INSTALL) -m 644 include/nanoamt/relay_posix.h "$(DESTDIR)$(INCLUDEDIR)/nanoamt/relay_posix.h"
 endif
 
 clean:
 	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(CORE_LIB) $(POSIX_LIB) $(AMTQ_LIB) $(OPENSSL_LIB) \
     $(BUILD_DIR)/nanoamt-recv $(BUILD_DIR)/fuzz-nanoamt $(BUILD_DIR)/fuzz-amtq $(BUILD_DIR)/fuzz-amtq-relay $(BUILD_DIR)/fuzz-relay \
-    $(addprefix $(TEST_DIR)/,test-nanoamt test-rfc test-membership test-relay test-openssl test-posix test-kernel test-amtq test-amtq-relay)
+    $(addprefix $(TEST_DIR)/,test-nanoamt test-rfc test-membership test-relay test-openssl test-posix test-relay-posix test-kernel test-amtq test-amtq-relay)
 
 -include $(OBJECTS:.o=.d)

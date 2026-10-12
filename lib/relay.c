@@ -373,11 +373,11 @@ static int update(nanoamt_relay *r, const nanoamt_endpoint *peer, const nanoamt_
     nanoamt_memberships_free(retained);
   if (!c->id) {
     c->id = ++r->last_id;
-    c->peer = *peer;
-    c->local = *local;
     c->mtu = r->config.path_mtu;
     ++r->stats.clients;
   }
+  c->peer = *peer;
+  c->local = *local;
   nanoamt_memberships_free(c->requested);
   nanoamt_memberships_free(c->authorized);
   c->requested = candidate;
@@ -658,7 +658,7 @@ int nanoamt_relay_output_valid(nanoamt_relay *r, int64_t now, const nanoamt_rela
     return 0;
   relay_client *c = find_client(r, &out->destination, &out->source);
   ip_packet ip;
-  return c && c->id == out->tunnel_id && size - 2 <= tunnel_mtu(c) &&
+  return c && c->id == out->tunnel_id && c->local.scope_id == out->source.scope_id && size - 2 <= tunnel_mtu(c) &&
          nanoamt_ip_forward_decode(bytes + 2, size - 2, &ip) && ip.size == size - 2 && allowed(c, &ip) &&
          out->tos == (c->ecn[ip.version == 6] ? ip.tos & 3u : 0);
 }

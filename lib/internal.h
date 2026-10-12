@@ -47,9 +47,10 @@ static inline void write16(uint8_t *p, uint16_t n) {
   p[1] = (uint8_t)n;
 }
 static inline int endpoint_equal(const nanoamt_endpoint *a, const nanoamt_endpoint *b) {
+  int scoped = ip_version(a->ip_version) == 6 &&
+               ((a->ip[0] == 0xfe && (a->ip[1] & 0xc0u) == 0x80u) || (a->ip[0] == 0xff && (a->ip[1] & 15u) <= 2));
   return ip_version(a->ip_version) == ip_version(b->ip_version) && a->port == b->port &&
-         (ip_version(a->ip_version) != 6 || a->scope_id == b->scope_id) &&
-         memcmp(a->ip, b->ip, ip_address_size(a->ip_version)) == 0;
+         (!scoped || a->scope_id == b->scope_id) && memcmp(a->ip, b->ip, ip_address_size(a->ip_version)) == 0;
 }
 static inline int unicast(const uint8_t *p) {
   return p[0] != 0 && p[0] < 224;
