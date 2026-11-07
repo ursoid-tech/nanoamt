@@ -2,7 +2,8 @@
 
 void amtq_frag_clear(amtq_fragment_slot *s) {
   free(s->data);
-  free(s->seen);
+  free(s->starts);
+  free(s->ends);
   memset(s, 0, sizeof(*s));
 }
 void amtq_frag_expire(amtq_reassembly *r, int64_t now) {
@@ -41,8 +42,9 @@ int amtq_frag_push(amtq_reassembly *r, int64_t now, const nanoamtq_datagram *d, 
     s = vacant ? vacant : oldest;
     amtq_frag_clear(s);
     s->data = malloc(d->total_size);
-    s->seen = calloc((d->total_size + 7) / 8, 1);
-    if (!s->data || !s->seen) {
+    s->starts = malloc(r->max_ranges * sizeof(*s->starts));
+    s->ends = malloc(r->max_ranges * sizeof(*s->ends));
+    if (!s->data || !s->starts || !s->ends) {
       amtq_frag_clear(s);
       return NANOAMTQ_IGNORED;
     }
@@ -52,32 +54,34 @@ int amtq_frag_push(amtq_reassembly *r, int64_t now, const nanoamtq_datagram *d, 
   }
   if (s->total != d->total_size)
     goto discard;
-  for (size_t i = 0; i < d->size; ++i) {
-    size_t at = d->offset + i;
-    if ((s->seen[at / 8] & (1u << (at % 8))) && s->data[at] != d->data[i])
-      goto discard;
-  }
   size_t end = d->offset + d->size;
-  for (unsigned i = 0; i < s->ranges; ++i)
+  for (unsigned i = 0; i < s->ranges; ++i) {
     if (s->starts[i] == d->offset && s->ends[i] == end) {
+      if (memcmp(s->data + d->offset, d->data, d->size))
+        goto discard;
       s->updated = now;
       return NANOAMTQ_IGNORED;
     }
+    size_t low = s->starts[i] > d->offset ? s->starts[i] : d->offset;
+    size_t high = s->ends[i] < end ? s->ends[i] : end;
+    if (low < high && memcmp(s->data + low, d->data + (low - d->offset), high - low))
+      goto discard;
+  }
   if (s->ranges == r->max_ranges)
     goto discard;
+  memcpy(s->data + d->offset, d->data, d->size);
   s->starts[s->ranges] = (uint32_t)d->offset;
   s->ends[s->ranges++] = (uint32_t)end;
-  for (size_t i = 0; i < d->size; ++i) {
-    size_t at = d->offset + i;
-    if (!(s->seen[at / 8] & (1u << (at % 8)))) {
-      s->seen[at / 8] |= (uint8_t)(1u << (at % 8));
-      ++s->received;
-    }
-    s->data[at] = d->data[i];
-  }
   s->updated = now;
-  if (s->received != s->total)
-    return NANOAMTQ_IGNORED;
+  for (size_t covered = 0; covered < s->total;) {
+    size_t next = covered;
+    for (unsigned i = 0; i < s->ranges; ++i)
+      if (s->starts[i] <= covered && s->ends[i] > next)
+        next = s->ends[i];
+    if (next == covered)
+      return NANOAMTQ_IGNORED;
+    covered = next;
+  }
   memcpy(out, s->data, s->total);
   amtq_frag_clear(s);
   return NANOAMTQ_PACKET;

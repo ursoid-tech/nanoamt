@@ -111,6 +111,16 @@ static void teardown(void) {
   CHECK(nanoamt_send(g, now, &report) == NANOAMT_PACKET && report.bytes[0] == 7 && report.bytes[29] == 8);
   CHECK(!memcmp(report.bytes + 2, "NEWKEY", 6));
   nanoamt_free(g);
+  g = start(&c, &request, &old, 1);
+  now = nanoamt_next_timeout(g);
+  while (nanoamt_send(g, now, &request) == NANOAMT_PACKET && request.bytes[0] != 3)
+    now = nanoamt_next_timeout(g);
+  n = fixture_query(p, &request, 125, 1);
+  p[n - 1] = 8;
+  CHECK(nanoamt_receive(g, now, &c.discovery, p, n, &packet) == NANOAMT_OK);
+  CHECK(nanoamt_leave(g, now) == NANOAMT_OK);
+  CHECK(nanoamt_send(g, now, &report) == NANOAMT_PACKET && report.bytes[0] == 7 && report.bytes[29] == 7);
+  nanoamt_free(g);
   c.direct = 1;
   g = start(&c, &request, &report, 0);
   nanoamt_free(g);

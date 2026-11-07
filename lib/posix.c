@@ -112,22 +112,24 @@ void nanoamt_posix_close(nanoamt_posix *io) {
 }
 
 int nanoamt_posix_fd(const nanoamt_posix *io) {
-  return io->fd;
+  return io ? io->fd : -1;
 }
 nanoamt_state nanoamt_posix_get_state(const nanoamt_posix *io) {
-  return nanoamt_get_state(io->gateway);
+  return io ? nanoamt_get_state(io->gateway) : NANOAMT_STATE_CLOSED;
 }
 int nanoamt_posix_is_joined(const nanoamt_posix *io) {
-  return io->membership_sent && nanoamt_is_joined(io->gateway);
+  return io && io->membership_sent && nanoamt_is_joined(io->gateway);
 }
 int64_t nanoamt_posix_next_timeout(const nanoamt_posix *io) {
-  return io->output.size ? INT64_MAX : nanoamt_next_timeout(io->gateway);
+  return !io || io->output.size ? INT64_MAX : nanoamt_next_timeout(io->gateway);
 }
 int nanoamt_posix_wants_write(const nanoamt_posix *io) {
-  return io->output.size != 0;
+  return io && io->output.size != 0;
 }
 
 int nanoamt_posix_send(nanoamt_posix *io, int64_t now) {
+  if (!io)
+    return NANOAMT_ERROR_ARGUMENT;
   if (!nanoamt_is_joined(io->gateway))
     io->membership_sent = 0;
   if (!io->output.size) {
@@ -171,9 +173,10 @@ int nanoamt_posix_send(nanoamt_posix *io, int64_t now) {
 }
 
 int nanoamt_posix_receive(nanoamt_posix *io, int64_t now, nanoamt_packet *packet) {
-  if (!packet)
+  if (packet)
+    memset(packet, 0, sizeof(*packet));
+  if (!io || !packet)
     return NANOAMT_ERROR_ARGUMENT;
-  memset(packet, 0, sizeof(*packet));
   struct sockaddr_storage from = {0};
   struct iovec vec = {io->input, sizeof(io->input)};
   union {
@@ -223,6 +226,8 @@ int nanoamt_posix_receive(nanoamt_posix *io, int64_t now, nanoamt_packet *packet
 }
 
 int nanoamt_posix_leave(nanoamt_posix *io, int64_t now) {
+  if (!io)
+    return NANOAMT_ERROR_ARGUMENT;
   io->output.size = 0;
   return nanoamt_leave(io->gateway, now);
 }

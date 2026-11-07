@@ -4,17 +4,17 @@ int nanoamt_query_decode(uint8_t *bytes, size_t size, unsigned version, uint32_t
   ip_packet ip;
   static const uint8_t all_hosts[4] = {224, 0, 0, 1},
                        all_nodes[16] = {255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-  if (!nanoamt_ip_decode(bytes, size, &ip) || ip.version != version || ip.ttl != 1)
+  if (!nanoamt_ip_decode(bytes, size, &ip) || ip.version != version || ip.size != size || ip.ttl != 1)
     return 0;
   uint8_t *q = ip.payload;
   size_t offset;
   if (ip.version == 4) {
-    if (ip.protocol != 2 || ip.payload_size < 12 || memcmp(ip.destination, all_hosts, 4) || q[0] != 0x11 ||
+    if (ip.protocol != 2 || ip.payload_size != 12 || memcmp(ip.destination, all_hosts, 4) || q[0] != 0x11 ||
         !zero(q + 4, 4) || read16(q + 10) || nanoamt_checksum(q, ip.payload_size, 0))
       return 0;
     offset = 8;
   } else {
-    if (ip.protocol != 58 || ip.payload_size < 28 || !ip.router_alert || memcmp(ip.destination, all_nodes, 16) ||
+    if (ip.protocol != 58 || ip.payload_size != 28 || !ip.router_alert || memcmp(ip.destination, all_nodes, 16) ||
         q[0] != 130 || q[1] || !zero(q + 8, 16) || read16(q + 26) ||
         nanoamt_checksum(q, ip.payload_size, nanoamt_pseudo_sum(&ip, 58, ip.payload_size)))
       return 0;

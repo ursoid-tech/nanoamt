@@ -50,8 +50,10 @@ static int random_delay(nanoamt *g, uint32_t low, uint32_t high, uint32_t *delay
 }
 
 static void schedule_teardown(nanoamt *g) {
-  if (g->joined && g->session.has_endpoint)
+  if (g->joined && g->session.has_endpoint) {
     g->teardown = g->session;
+    g->joined = 0;
+  }
 }
 
 static void discover(nanoamt *g, int64_t now) {
@@ -152,8 +154,6 @@ int nanoamt_send(nanoamt *g, int64_t now, nanoamt_datagram *out) {
 
   if (g->teardown.has_endpoint) {
     g->teardown.has_endpoint = 0;
-    if (g->state == NANOAMT_STATE_REPORTING)
-      g->joined = 0;
     return emit_teardown(&g->teardown, out);
   }
   uint32_t delay;
@@ -323,6 +323,11 @@ int nanoamt_leave(nanoamt *g, int64_t now) {
     return NANOAMT_ERROR_ARGUMENT;
   if (g->state == NANOAMT_STATE_LEAVING || g->state == NANOAMT_STATE_CLOSED)
     return NANOAMT_OK;
+  if (g->teardown.has_endpoint) {
+    g->session = g->teardown;
+    g->teardown.has_endpoint = 0;
+    g->joined = 1;
+  }
   g->state = g->joined ? NANOAMT_STATE_LEAVING : NANOAMT_STATE_CLOSED;
   g->joined = 0;
   g->repeats = g->robustness;

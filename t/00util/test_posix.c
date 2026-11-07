@@ -150,6 +150,15 @@ static void exchange(int v6) {
 }
 
 int main(void) {
+  CHECK(nanoamt_posix_fd(NULL) == -1);
+  CHECK(nanoamt_posix_get_state(NULL) == NANOAMT_STATE_CLOSED);
+  CHECK(!nanoamt_posix_is_joined(NULL));
+  CHECK(nanoamt_posix_next_timeout(NULL) == INT64_MAX);
+  CHECK(!nanoamt_posix_wants_write(NULL));
+  CHECK(nanoamt_posix_send(NULL, 0) == NANOAMT_ERROR_ARGUMENT);
+  nanoamt_packet packet;
+  CHECK(nanoamt_posix_receive(NULL, 0, &packet) == NANOAMT_ERROR_ARGUMENT);
+  CHECK(nanoamt_posix_leave(NULL, 0) == NANOAMT_ERROR_ARGUMENT);
   exchange(0);
   exchange(1);
   puts("posix: real UDP discovery, query, report, data and leave passed");

@@ -15,10 +15,10 @@ int amtq_header(const uint8_t *bytes, size_t size, uint64_t *type, size_t *lengt
 typedef struct amtq_fragment_slot {
   uint64_t context, id;
   int64_t updated;
-  size_t total, received;
+  size_t total;
   unsigned ranges;
-  uint32_t starts[AMTQ_MAX_RANGES], ends[AMTQ_MAX_RANGES];
-  uint8_t *data, *seen;
+  uint32_t *starts, *ends;
+  uint8_t *data;
 } amtq_fragment_slot;
 typedef struct amtq_reassembly {
   amtq_fragment_slot *slots;

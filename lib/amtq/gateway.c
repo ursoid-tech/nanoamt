@@ -16,8 +16,10 @@ struct nanoamtq {
   context contexts[NANOAMTQ_MAX_CONTEXTS];
   nanoamtq_membership desired[NANOAMTQ_MAX_MEMBERSHIPS], sent[NANOAMTQ_MAX_MEMBERSHIPS];
   size_t desired_count, sent_count;
-  uint8_t control[NANOAMTQ_MAX_CONTROL_VALUE + 16];
-  size_t control_size, control_target;
+  uint64_t control_type;
+  size_t control_size, control_target, control_header;
+  uint8_t control_head[16];
+  uint8_t control[1024];
   amtq_reassembly fragments;
   nanoamt_reassembly *ip_fragments;
   uint8_t message[NANOAMTQ_MAX_DATA_MESSAGE];
@@ -209,9 +211,8 @@ int nanoamtq_send(nanoamtq *g, int64_t now, nanoamtq_control *out) {
   if (g->requesting)
     return NANOAMTQ_OK;
   if (g->queried && g->dirty) {
-    uint8_t data[NANOAMTQ_CONTROL_CAPACITY];
-    size_t n = report(g, data);
-    rc = emit(g, out, NANOAMTQ_AMT_CONTROL, data, n);
+    size_t n = report(g, g->message);
+    rc = emit(g, out, NANOAMTQ_AMT_CONTROL, g->message, n);
     if (rc == NANOAMTQ_PACKET) {
       memcpy(g->sent, g->desired, g->desired_count * sizeof(*g->sent));
       g->sent_count = g->desired_count;
@@ -235,36 +236,24 @@ int nanoamtq_send(nanoamtq *g, int64_t now, nanoamtq_control *out) {
   }
   return NANOAMTQ_OK;
 }
-static int compare_ids(const void *a, const void *b) {
-  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-  return (x > y) - (x < y);
-}
 static int settings(nanoamtq *g, const uint8_t *p, size_t n) {
   if (g->peer_settings || !n)
     return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
-  uint64_t *ids = malloc((n / 2 + 1) * sizeof(*ids));
-  if (!ids)
-    return protocol(g, NANOAMTQ_CLOSE_INTERNAL);
-  size_t at = 0, count = 0;
-  int valid = 1, modes = 0;
+  size_t at = 0;
+  int modes = 0;
   while (at < n) {
-    uint64_t id, value;
-    if (!amtq_get(p, n, &at, &id) || !amtq_get(p, n, &at, &value)) {
-      valid = 0;
-      break;
+    size_t entry = at, check = 0;
+    uint64_t id, value, seen_id, seen_value;
+    if (!amtq_get(p, n, &at, &id) || !amtq_get(p, n, &at, &value) || id == 1)
+      return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
+    while (check < entry) {
+      if (!amtq_get(p, entry, &check, &seen_id) || !amtq_get(p, entry, &check, &seen_value) || seen_id == id)
+        return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
     }
-    ids[count++] = id;
     if (id == 0)
       modes = (value & 1) != 0;
-    if (id == 1)
-      valid = 0;
   }
-  qsort(ids, count, sizeof(*ids), compare_ids);
-  for (size_t i = 1; i < count; ++i)
-    if (ids[i] == ids[i - 1])
-      valid = 0;
-  free(ids);
-  if (!valid || !modes)
+  if (!modes)
     return protocol(g, NANOAMTQ_CLOSE_SETTINGS);
   g->peer_settings = 1;
   if (g->local_settings)
@@ -285,11 +274,8 @@ static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
   if (type == NANOAMTQ_AMT_CONTROL) {
     uint32_t interval;
     unsigned robustness;
-    ip_packet ip;
     if (n < 12 || p[0] != 4 || (p[1] & ~2u) || !zero(p + 2, 6) || !g->requesting || memcmp(p + 8, g->nonce, 4) ||
-        !nanoamt_query_decode(p + 12, n - 12, g->config.ip_version, &interval, &robustness) ||
-        !nanoamt_ip_decode(p + 12, n - 12, &ip) || ip.size != n - 12 ||
-        ip.payload_size != (g->config.ip_version == 6 ? 28u : 12u))
+        !nanoamt_query_decode(p + 12, n - 12, g->config.ip_version, &interval, &robustness))
       return protocol(g, NANOAMTQ_CLOSE_AMT_MESSAGE);
     g->requesting = 0;
     g->queried = g->dirty = 1;
@@ -337,47 +323,43 @@ int nanoamtq_receive_control(nanoamtq *g, int64_t now, uint64_t stream, const ui
   if (stream || fin)
     return protocol(g, NANOAMTQ_CLOSE_CONTROL_STREAM);
   while (n) {
-    if (!g->control_target) {
-      g->control[g->control_size++] = *p++;
+    if (!g->control_header) {
+      g->control_head[g->control_size++] = *p++;
       --n;
-      uint64_t type;
       size_t len, header;
-      rc = amtq_header(g->control, g->control_size, &type, &len, &header);
+      rc = amtq_header(g->control_head, g->control_size, &g->control_type, &len, &header);
       if (rc == NANOAMTQ_INCOMPLETE)
         continue;
       if (rc)
         return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
-      g->control_target = header + len;
+      if (g->control_type <= NANOAMTQ_CONTEXT_ACK && len > sizeof(g->control))
+        return protocol(g, g->control_type == NANOAMTQ_SETTINGS      ? NANOAMTQ_CLOSE_SETTINGS
+                           : !g->peer_settings || !g->local_settings ? NANOAMTQ_CLOSE_PROTOCOL
+                           : g->control_type == NANOAMTQ_AMT_CONTROL ? NANOAMTQ_CLOSE_AMT_MESSAGE
+                                                                     : NANOAMTQ_CLOSE_PROTOCOL);
+      g->control_header = header;
+      g->control_target = len;
+      g->control_size = 0;
     }
-    size_t take = g->control_target - g->control_size;
-    if (take > n)
-      take = n;
-    if (take)
+    size_t remaining = g->control_target - g->control_size;
+    size_t take = remaining < n ? remaining : n;
+    if (take && g->control_type <= NANOAMTQ_CONTEXT_ACK)
       memcpy(g->control + g->control_size, p, take);
     g->control_size += take;
     p += take;
     n -= take;
     if (g->control_size == g->control_target) {
-      nanoamtq_record r;
-      size_t consumed;
-      rc = nanoamtq_record_decode(g->control, g->control_size, &r, &consumed);
-      if (rc)
-        return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
-      rc = handle(g, r.type, g->control + consumed - r.size, r.size);
-      g->control_size = g->control_target = 0;
+      size_t body = g->control_size;
+      g->control_size = g->control_target = g->control_header = 0;
+      rc = handle(g, g->control_type, g->control, body);
       if (rc)
         return rc;
     }
   }
   return NANOAMTQ_OK;
 }
-static int requested(nanoamtq *g, const ip_packet *ip) {
-  size_t addr = ip_address_size(g->config.ip_version);
-  for (size_t i = 0; i < g->sent_count; ++i)
-    if (!memcmp(g->sent[i].group, ip->destination, addr) &&
-        (g->sent[i].any_source || !memcmp(g->sent[i].source, ip->source, addr)))
-      return 1;
-  return 0;
+static int match_membership(const nanoamtq_membership *m, const uint8_t *source, const uint8_t *group, size_t addr) {
+  return !memcmp(m->group, group, addr) && (m->any_source || !memcmp(m->source, source, addr));
 }
 int nanoamtq_receive_datagram(nanoamtq *g, int64_t now, const uint8_t *p, size_t n, nanoamt_packet *packet) {
   if (packet)
@@ -412,19 +394,28 @@ int nanoamtq_receive_datagram(nanoamtq *g, int64_t now, const uint8_t *p, size_t
     return NANOAMTQ_IGNORED;
   if (!nanoamt_reassemble(g->ip_fragments, now, &ip_bytes, &size))
     return NANOAMTQ_IGNORED;
-  ip_packet ip;
-  if (!nanoamt_ip_decode(ip_bytes, size, &ip) || ip.version != g->config.ip_version || !requested(g, &ip))
+  size_t addr = ip_address_size(g->config.ip_version), source_offset = g->config.ip_version == 6 ? 8 : 12;
+  if (size < source_offset + 2 * addr)
     return NANOAMTQ_IGNORED;
-  for (size_t i = 0; i < g->desired_count; ++i) {
-    nanoamt_config filter = {0};
-    filter.ip_version = g->config.ip_version;
-    filter.any_source = g->desired[i].any_source;
-    filter.port = g->desired[i].port;
-    memcpy(filter.source, g->desired[i].source, 16);
-    memcpy(filter.group, g->desired[i].group, 16);
-    if (nanoamt_udp_decode(ip_bytes, size, &filter, packet))
+  nanoamt_config filter = {0};
+  filter.ip_version = g->config.ip_version;
+  filter.any_source = 1;
+  memcpy(filter.group, ip_bytes + source_offset + addr, addr);
+  nanoamt_packet decoded = {0};
+  if (!nanoamt_udp_decode(ip_bytes, size, &filter, &decoded))
+    return NANOAMTQ_IGNORED;
+  size_t i;
+  for (i = 0; i < g->sent_count; ++i)
+    if (match_membership(&g->sent[i], decoded.source.ip, decoded.destination.ip, addr))
+      break;
+  if (i == g->sent_count)
+    return NANOAMTQ_IGNORED;
+  for (i = 0; i < g->desired_count; ++i)
+    if (match_membership(&g->desired[i], decoded.source.ip, decoded.destination.ip, addr) &&
+        (!g->desired[i].port || (decoded.protocol == 17 && decoded.destination.port == g->desired[i].port))) {
+      *packet = decoded;
       return NANOAMTQ_PACKET;
-  }
+    }
   return NANOAMTQ_IGNORED;
 }
 int64_t nanoamtq_next_timeout(const nanoamtq *g) {
