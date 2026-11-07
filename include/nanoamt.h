@@ -16,7 +16,7 @@ typedef struct nanoamt_endpoint {
   uint8_t ip[16]; /* 4 octets for IPv4 */
   uint16_t port;
   uint8_t ip_version; /* 0/4: IPv4, 6: IPv6 */
-  uint32_t scope_id;  /* IPv6 scope index */
+  uint32_t scope_id;  /* IPv6 address scope; relay local endpoints also carry ingress interface index */
 } nanoamt_endpoint;
 
 typedef enum nanoamt_state {

@@ -71,6 +71,17 @@ static void ready(nanoamtq *g, nanoamt_config *c) {
   CHECK(nanoamtq_send(g, 1, &out) == NANOAMTQ_PACKET);
   CHECK(out.size == 3 && !memcmp(out.bytes, "\4\1\0", 3));
   CHECK(nanoamtq_is_ready(g));
+  CHECK(nanoamtq_memberships_submitted(g));
+  CHECK(!nanoamtq_set_memberships(g, NULL, 0));
+  CHECK(nanoamtq_is_ready(g)); /* Existing context remains usable. */
+  CHECK(!nanoamtq_memberships_submitted(g));
+  CHECK(nanoamtq_send(g, 1, &out) == NANOAMTQ_PACKET);
+  CHECK(nanoamtq_memberships_submitted(g));
+  nanoamtq_membership m = interest(c);
+  CHECK(!nanoamtq_set_memberships(g, &m, 1));
+  CHECK(!nanoamtq_memberships_submitted(g));
+  CHECK(nanoamtq_send(g, 1, &out) == NANOAMTQ_PACKET);
+  CHECK(nanoamtq_memberships_submitted(g));
 }
 static int data(nanoamtq *g, int64_t now, nanoamt_config *c, nanoamt_packet *packet) {
   uint8_t message[128], encoded[160];

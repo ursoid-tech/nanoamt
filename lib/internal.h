@@ -21,6 +21,8 @@ typedef struct ip_packet {
   int router_alert;
 } ip_packet;
 
+struct nanoamt_memberships;
+int nanoamt_memberships_merge(struct nanoamt_memberships *out, const struct nanoamt_memberships *b);
 typedef struct nanoamt_reassembly nanoamt_reassembly;
 nanoamt_reassembly *nanoamt_reassembly_create(void);
 void nanoamt_reassembly_destroy(nanoamt_reassembly *r);
@@ -46,10 +48,22 @@ static inline void write16(uint8_t *p, uint16_t n) {
   p[0] = (uint8_t)(n >> 8);
   p[1] = (uint8_t)n;
 }
-static inline int endpoint_equal(const nanoamt_endpoint *a, const nanoamt_endpoint *b) {
-  return ip_version(a->ip_version) == ip_version(b->ip_version) && a->port == b->port &&
-         (ip_version(a->ip_version) != 6 || a->scope_id == b->scope_id) &&
+static inline int peer_ip_equal(const nanoamt_endpoint *a, const nanoamt_endpoint *b) {
+  int scoped = ip_version(a->ip_version) == 6 &&
+               ((a->ip[0] == 0xfe && (a->ip[1] & 0xc0u) == 0x80u) || (a->ip[0] == 0xff && (a->ip[1] & 15u) <= 2));
+  return ip_version(a->ip_version) == ip_version(b->ip_version) && (!scoped || a->scope_id == b->scope_id) &&
          memcmp(a->ip, b->ip, ip_address_size(a->ip_version)) == 0;
+}
+static inline int endpoint_equal(const nanoamt_endpoint *a, const nanoamt_endpoint *b) {
+  return a->port == b->port && peer_ip_equal(a, b);
+}
+static inline void ip_header_view(const uint8_t *bytes, size_t size, ip_packet *ip) {
+  unsigned v = bytes[0] >> 4;
+  *ip = (ip_packet){.source = (uint8_t *)bytes + (v == 6 ? 8 : 12),
+                    .destination = (uint8_t *)bytes + (v == 6 ? 24 : 16),
+                    .size = size,
+                    .version = (uint8_t)v,
+                    .tos = (uint8_t)(v == 6 ? (bytes[0] << 4) | (bytes[1] >> 4) : bytes[1])};
 }
 static inline int unicast(const uint8_t *p) {
   return p[0] != 0 && p[0] < 224;
@@ -65,6 +79,9 @@ uint16_t nanoamt_checksum(const uint8_t *bytes, size_t size, uint32_t sum);
 int nanoamt_ecn_decapsulate(uint8_t *bytes, size_t size, unsigned outer);
 void nanoamt_ecn_set(uint8_t *bytes, unsigned ecn);
 int nanoamt_ip_decode(uint8_t *bytes, size_t size, ip_packet *ip);
+int nanoamt_ip_forward_decode(const uint8_t *bytes, size_t size, ip_packet *ip);
+size_t nanoamt_general_query(uint8_t *ip, unsigned version, const uint8_t *source, uint8_t qqic, unsigned robustness,
+                             uint32_t response_ms);
 uint32_t nanoamt_pseudo_sum(const ip_packet *ip, uint8_t protocol, size_t size);
 int nanoamt_query_decode(uint8_t *bytes, size_t size, unsigned version, uint32_t *interval_ms, unsigned *robustness);
 int nanoamt_udp_decode(uint8_t *bytes, size_t size, const nanoamt_config *config, nanoamt_packet *packet);
