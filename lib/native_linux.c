@@ -90,8 +90,7 @@ nanoamt_native *nanoamt_native_open(const nanoamt_native_config *config) {
   int one = 1;
   if (setsockopt(n->fd, SOL_PACKET, PACKET_AUXDATA, &one, sizeof(one)))
     goto fail;
-  /* SOCK_DGRAM packet sockets start at the network header. Reject unrelated
-   * unicast/link traffic in the kernel before allocating receive-queue work. */
+  /* SOCK_DGRAM packet sockets start at the network header; drop non-multicast in BPF */
   struct sock_filter instructions[] = {BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 0),
                                        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf0),
                                        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x40, 1, 0),

@@ -14,7 +14,7 @@ typedef struct reliable_stream {
   uint64_t id, context_id, block_id;
   unsigned stage; /* 0 free, 1 type, 2 context, 3 block, 4 length, 5 body, 6 unknown */
   uint8_t varint[8], *body;
-  size_t varint_size, size, target;
+  size_t varint_size, size, target, capacity;
   int records;
 } reliable_stream;
 typedef struct context {
@@ -122,6 +122,7 @@ void nanoamtq_free(nanoamtq *g) {
     clear_context(g->contexts + i);
   for (unsigned i = 0; i < NANOAMTQ_MAX_RELIABLE_STREAMS; ++i)
     free(g->streams[i].body);
+  free(g->control.bytes);
   free(g->fragments.slots);
   nanoamt_reassembly_destroy(g->ip_fragments);
   free(g);
@@ -294,8 +295,7 @@ static context *find_context(nanoamtq *g, uint64_t id) {
       return &g->contexts[i];
   return NULL;
 }
-/* Sorted merged intervals bound sparse/reordered identifiers without growing
- * memory for a long-lived contiguous stream of completed blocks. */
+/* sorted merged intervals bound sparse/reordered block IDs */
 static int range_insert(id_ranges *r, uint64_t id) {
   unsigned i = 0;
   while (i < r->count && r->values[i].last < id)
@@ -411,6 +411,8 @@ int nanoamtq_receive_control(nanoamtq *g, int64_t now, uint64_t stream, const ui
     return protocol(g, NANOAMTQ_CLOSE_CONTROL_STREAM);
   size_t consumed;
   rc = amtq_control_feed(&g->control, p, n, &consumed, receive_record, g);
+  if (rc == NANOAMTQ_ERROR_MEMORY)
+    return fail(g, rc, NANOAMTQ_CLOSE_INTERNAL);
   if (rc && !g->error)
     return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
   return rc;
@@ -598,10 +600,6 @@ int nanoamtq_receive_stream(nanoamtq *g, int64_t now, uint64_t id, const uint8_t
           return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
         s->target = (size_t)value;
         s->size = 0;
-        if (!s->body)
-          s->body = malloc(NANOAMTQ_MAX_DATA_MESSAGE);
-        if (!s->body)
-          return fail(g, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
         s->stage = 5;
       }
       continue;
@@ -609,13 +607,27 @@ int nanoamtq_receive_stream(nanoamtq *g, int64_t now, uint64_t id, const uint8_t
     size_t take = s->target - s->size;
     if (take > n - *consumed)
       take = n - *consumed;
-    memcpy(s->body + s->size, p + *consumed, take);
-    s->size += take;
-    *consumed += take;
+    if (!s->size && take == s->target) {
+      memcpy(g->message, p + *consumed, take);
+      s->size = take;
+      *consumed += take;
+    } else {
+      if (s->capacity < s->target) {
+        uint8_t *body = realloc(s->body, s->target);
+        if (!body)
+          return fail(g, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+        s->body = body;
+        s->capacity = s->target;
+      }
+      memcpy(s->body + s->size, p + *consumed, take);
+      s->size += take;
+      *consumed += take;
+      if (s->size == s->target)
+        memcpy(g->message, s->body, s->size);
+    }
     if (s->size == s->target) {
       s->records = 1;
       s->stage = 4;
-      memcpy(g->message, s->body, s->size);
       rc = g->reported ? deliver(g, now, s->size, packet) : NANOAMTQ_IGNORED;
       if (rc == NANOAMTQ_PACKET) {
         if (*consumed == n && event == NANOAMTQ_STREAM_FIN) {

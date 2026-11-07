@@ -253,8 +253,7 @@ static int apply_router(nanoamt_memberships *s, member_group *g, unsigned type, 
     if (type == 4)
       count = 0;
   }
-  /* RFC 3376 6.4 and RFC 3810 7.4. AMT suppresses generated queries,
-   * retaining their source/group timer actions for bounded leave latency. */
+  /* RFC 3376 6.4 and RFC 3810 7.4: retain timer actions without queries */
   if (type == 1 || type == 3 || type == 5) {
     if (type == 3) {
       for (size_t i = 0; i < g->count; ++i)
@@ -308,7 +307,7 @@ static int apply_router(nanoamt_memberships *s, member_group *g, unsigned type, 
 static int apply_record(nanoamt_memberships *s, unsigned version, const uint8_t *group, unsigned type,
                         const uint8_t *list, size_t count, int legacy) {
   if (type < 1 || type > 6)
-    return NANOAMT_OK; /* Unknown group records are skipped, not applied. */
+    return NANOAMT_OK; /* skip unknown group records */
   if (!multicast(group, version))
     return NANOAMT_IGNORED;
   size_t stride = ip_address_size(version);
@@ -334,7 +333,7 @@ static void restrict_record(nanoamt_memberships *s, unsigned version, const uint
                             const uint8_t *list, size_t count) {
   member_group *g = find_group(s, version, address);
   if (!g)
-    return; /* No room for a new group: ignore additions. */
+    return; /* no room for a new group */
   size_t stride = ip_address_size(version);
   int router = s->config.mode == NANOAMT_MEMBERSHIP_ROUTER;
   int64_t lmqt = deadline(s->now, s->config.last_member_time_ms);
@@ -347,8 +346,7 @@ static void restrict_record(nanoamt_memberships *s, unsigned version, const uint
   if (type == 1 || type == 3 || type == 5) {
     if (!router && type != 5) {
       if (g->exclude) {
-        /* Converting an unbounded EXCLUDE set to an oversized INCLUDE list
-         * cannot fit the configured representation; deny the entire group. */
+        /* oversized INCLUDE cannot replace EXCLUDE within bounds; drop group */
         remove_group(s, (size_t)(g - s->groups));
         return;
       }
@@ -392,7 +390,7 @@ static void restrict_record(nanoamt_memberships *s, unsigned version, const uint
         } else {
           int64_t until = router && type == 6 ? (g->until < lmqt ? g->until : lmqt) : 0;
           if (add_source(s, g, list + i * stride, until)) {
-            /* Unknown blocked sources cannot be represented safely. */
+            /* unrepresentable blocked source; drop group */
             remove_group(s, (size_t)(g - s->groups));
             return;
           }
@@ -407,20 +405,41 @@ static int attempt_record(nanoamt_memberships *s, unsigned version, const uint8_
                           const uint8_t *list, size_t count, int legacy, int *limited) {
   if (!limited)
     return apply_record(s, version, group, type, list, count, legacy);
-  nanoamt_memberships *trial = nanoamt_memberships_clone(s);
-  if (!trial)
-    return NANOAMT_RELAY_ERROR_MEMORY;
-  int rc = apply_record(trial, version, group, type, list, count, legacy);
+  member_group *existing = find_group(s, version, group);
+  if (!existing) {
+    int rc = apply_record(s, version, group, type, list, count, legacy);
+    if (rc == NANOAMT_RELAY_ERROR_LIMIT) {
+      member_group *added = find_group(s, version, group);
+      if (added)
+        remove_group(s, (size_t)(added - s->groups));
+      *limited = 1;
+      return NANOAMT_OK;
+    }
+    return rc;
+  }
+  member_group backup = *existing;
+  size_t old_sources = s->sources;
+  backup.sources = NULL;
+  backup.capacity = backup.count;
+  if (backup.count) {
+    backup.sources = malloc(backup.count * sizeof(*backup.sources));
+    if (!backup.sources)
+      return NANOAMT_RELAY_ERROR_MEMORY;
+    memcpy(backup.sources, existing->sources, backup.count * sizeof(*backup.sources));
+  }
+  int rc = apply_record(s, version, group, type, list, count, legacy);
   if (!rc) {
-    nanoamt_memberships old = *s;
-    *s = *trial;
-    *trial = old;
-  } else if (rc == NANOAMT_RELAY_ERROR_LIMIT) {
+    free(backup.sources);
+    return NANOAMT_OK;
+  }
+  free(existing->sources);
+  *existing = backup;
+  s->sources = old_sources;
+  if (rc == NANOAMT_RELAY_ERROR_LIMIT) {
     *limited = 1;
     restrict_record(s, version, group, type, list, count);
-    rc = NANOAMT_OK;
+    return NANOAMT_OK;
   }
-  nanoamt_memberships_free(trial);
   return rc;
 }
 static int parse_report(nanoamt_memberships *s, const uint8_t *bytes, size_t size, unsigned version, int *limited) {
@@ -501,8 +520,7 @@ static int apply(nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size
     for (size_t i = 0; !rc && i < candidate->count; ++i)
       if (candidate->groups[i].count > s->config.max_sources_per_group)
         rc = NANOAMT_RELAY_ERROR_LIMIT;
-    /* Seal the scratch state before exposing it: no enlarged capacity persists
-     * after commit, even when the report briefly joins before withdrawing. */
+    /* shrink scratch capacity before committing */
     for (size_t i = 0; !rc && i < candidate->count; ++i) {
       member_group *g = candidate->groups + i;
       if (!g->count) {
@@ -641,6 +659,27 @@ static int combine(const nanoamt_memberships *a, const nanoamt_memberships *b, i
       }
     }
   *output = out;
+  return NANOAMT_OK;
+}
+int nanoamt_memberships_merge(nanoamt_memberships *out, const nanoamt_memberships *b) {
+  if (!out || !b || out->now != b->now || out->config.mode != NANOAMT_MEMBERSHIP_ENDPOINT)
+    return NANOAMT_ERROR_ARGUMENT;
+  for (size_t i = 0; i < b->count; ++i) {
+    const member_group *gb = b->groups + i;
+    member_group *ga = find_group(out, gb->version, gb->address);
+    member_group old = {0};
+    if (ga) {
+      old = *ga;
+      out->sources -= old.count;
+      ga->sources = NULL;
+      ga->count = ga->capacity = 0;
+      ga->exclude = 0;
+    }
+    int rc = combine_group(out, out, ga ? &old : NULL, b, gb, 0);
+    free(old.sources);
+    if (rc)
+      return rc;
+  }
   return NANOAMT_OK;
 }
 int nanoamt_memberships_union(const nanoamt_memberships *a, const nanoamt_memberships *b, nanoamt_memberships **out) {

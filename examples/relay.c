@@ -157,6 +157,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "AMT relay listening on UDP %u; upstream interface %s\n", relay_config.listen.port, interface);
   int failed = 0;
   int previous_prune_error = 0;
+  uint64_t prune_generation = 0;
   int64_t prune_logged_at = now;
   while (!stopping) {
     now = clock_ms();
@@ -170,15 +171,19 @@ int main(int argc, char **argv) {
       failed = 1;
       break;
     }
-    /* Prune stale/withdrawn upstream subscriptions after the core advances.
-     * Failed native additions preserve old joins; core filtering still gates
-     * reception while the controller retries reconciliation. */
-    rc = prune(relay, native, now);
-    if (rc && (rc != previous_prune_error || now - prune_logged_at >= 1000)) {
-      fprintf(stderr, "native reconciliation error %d (%s)\n", rc, strerror(errno));
-      prune_logged_at = now;
+    /* prune stale upstream subscriptions after teardowns, expiries, or denied updates */
+    nanoamt_relay_stats core_stats;
+    nanoamt_relay_get_stats(nanoamt_relay_posix_core(relay), &core_stats);
+    uint64_t generation = core_stats.denied + core_stats.teardowns + core_stats.timer_scans;
+    if (generation != prune_generation || previous_prune_error) {
+      rc = prune(relay, native, now);
+      if (rc && (rc != previous_prune_error || now - prune_logged_at >= 1000)) {
+        fprintf(stderr, "native reconciliation error %d (%s)\n", rc, strerror(errno));
+        prune_logged_at = now;
+      }
+      previous_prune_error = rc;
+      prune_generation = generation;
     }
-    previous_prune_error = rc;
     struct pollfd fds[2] = {{nanoamt_relay_posix_fd(relay), POLLIN, 0}, {nanoamt_native_fd(native), POLLIN, 0}};
     if (nanoamt_relay_posix_wants_write(relay))
       fds[0].events |= POLLOUT;

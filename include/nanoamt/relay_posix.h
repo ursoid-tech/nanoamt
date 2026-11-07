@@ -22,8 +22,7 @@ typedef struct nanoamt_relay_posix_config {
   unsigned control_burst;    /* 0: 256 */
   unsigned source_rate;      /* 0: 100 packets/sec per source IP */
   unsigned source_burst;     /* 0: 32; source table has 64 bounded LRU slots */
-  /* Called synchronously for a core MTU event; quote is borrowed. The provider
-   * emits/rate-limits native ICMP. No callback means feedback is counted only. */
+  /* called synchronously for core MTU events; quote is borrowed */
   void (*mtu_feedback)(void *context, int64_t now_ms, const uint8_t *ip, size_t size, uint32_t mtu);
   void *feedback_context;
 } nanoamt_relay_posix_config;
@@ -33,9 +32,8 @@ typedef struct nanoamt_relay_posix_stats {
   size_t queued_controls, queued_inputs, retained_input_bytes;
 } nanoamt_relay_posix_stats;
 
-/* Linux packet-info support is required; unsupported platforms return ENOTSUP.
- * Single-threaded, caller-clocked. relay.response_mac is mandatory; missing
- * random_bytes uses /dev/urandom. Queues own copies, never caller storage. */
+/* Linux packet-info support required (otherwise ENOTSUP); single-threaded,
+ * caller-clocked; missing random_bytes uses /dev/urandom */
 nanoamt_relay_posix *nanoamt_relay_posix_open(const nanoamt_relay_posix_config *config, int64_t now_ms);
 void nanoamt_relay_posix_close(nanoamt_relay_posix *io);
 int nanoamt_relay_posix_fd(const nanoamt_relay_posix *io);

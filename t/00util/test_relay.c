@@ -267,10 +267,19 @@ static void authentication(void) {
   CHECK(pending.tos == 2);
   CHECK(!nanoamt_leave(g, 1));
   CHECK(nanoamt_send(g, 1, &report) == NANOAMT_PACKET);
-  /* Authenticated Teardown is tied to its embedded endpoint, not new NAT port. */
+  /* authenticated teardown matches embedded endpoint, including link-local IPv6 */
   CHECK(!nanoamt_relay_receive(r, 1, &rebound, &config.discovery, report.bytes, report.size, &control));
   nanoamt_relay_get_stats(r, &stats);
   CHECK(!stats.clients && stats.teardowns == 1);
+  nanoamt_free(g);
+  nanoamt_config ll_config = fixture_dual_config(&random, 1, 1, 0);
+  nanoamt_endpoint ll_peer = {.ip = {0xfe, 0x80, [15] = 2}, .port = 40002, .ip_version = 6, .scope_id = 3};
+  g = join(r, &ll_config, &ll_peer, 1, &report);
+  CHECK(!nanoamt_leave(g, 1));
+  CHECK(nanoamt_send(g, 1, &report) == NANOAMT_PACKET);
+  CHECK(!nanoamt_relay_receive(r, 1, &ll_peer, &ll_config.discovery, report.bytes, report.size, &control));
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(!stats.clients && stats.teardowns == 2);
   nanoamt_free(g);
   nanoamt_relay_free(r);
   /* Cookie from the prior secret survives rotation for the overlap. */

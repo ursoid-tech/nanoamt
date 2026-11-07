@@ -9,38 +9,42 @@ int amtq_control_feed(amtq_control_reader *r, const uint8_t *p, size_t n, size_t
     if (!r->target) {
       if (r->size == 16)
         return NANOAMTQ_ERROR_PROTOCOL;
-      r->bytes[r->size++] = *p++;
+      r->header[r->size++] = *p++;
       ++*consumed;
       --n;
-      uint64_t type;
-      size_t len, header;
-      int rc = amtq_header(r->bytes, r->size, &type, &len, &header);
+      size_t len;
+      int rc = amtq_header(r->header, r->size, &r->type, &len, &r->header_size);
       if (rc == NANOAMTQ_INCOMPLETE)
         continue;
       if (rc)
         return rc;
-      r->target = header + len;
+      if (r->type <= NANOAMTQ_CONTEXT_ACK && len > r->capacity) {
+        uint8_t *bytes = realloc(r->bytes, len);
+        if (!bytes)
+          return NANOAMTQ_ERROR_MEMORY;
+        r->bytes = bytes;
+        r->capacity = len;
+      }
+      r->target = r->header_size + len;
     }
     size_t take = r->target - r->size;
     if (take > n)
       take = n;
     if (take) {
-      memcpy(r->bytes + r->size, p, take);
+      if (r->type <= NANOAMTQ_CONTEXT_ACK)
+        memcpy(r->bytes + (r->size - r->header_size), p, take);
       p += take;
       n -= take;
       *consumed += take;
       r->size += take;
     }
     if (r->size == r->target) {
-      nanoamtq_record record;
-      size_t used;
-      int rc = nanoamtq_record_decode(r->bytes, r->size, &record, &used);
+      size_t value_size = r->target - r->header_size;
+      uint64_t type = r->type;
+      r->size = r->target = r->header_size = 0;
+      int rc = handle(context, type, r->bytes ? r->bytes : r->header, value_size);
       if (rc)
-        return rc;
-      r->size = r->target = 0;
-      rc = handle(context, record.type, r->bytes + used - record.size, record.size);
-      if (rc)
-        return rc; /* Caller retains the unconsumed suffix across a pause. */
+        return rc; /* caller retains unconsumed suffix across a pause */
     }
   }
   return NANOAMTQ_OK;

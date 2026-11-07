@@ -28,21 +28,18 @@ typedef struct nanoamt_native_stats {
   size_t groups, sources;
 } nanoamt_native_stats;
 
-/* Linux only; AF_PACKET needs CAP_NET_RAW. Single-threaded, nonblocking.
- * Each group has its own RFC 3678 subscription socket. Kernel filter limits
- * may reject a transaction even within configured bounds. No partial grant. */
+/* Linux only; AF_PACKET requires CAP_NET_RAW; single-threaded, nonblocking;
+ * each group uses its own RFC 3678 subscription socket */
 nanoamt_native *nanoamt_native_open(const nanoamt_native_config *config);
 void nanoamt_native_close(nanoamt_native *native);
 int nanoamt_native_fd(const nanoamt_native *native);
-/* Allocate/prepare before replacing subscriptions. Failure preserves prior
- * joins and capture policy. After relay expiry/withdrawal, reconcile the new
- * aggregate snapshot too, to prune native interest. Snapshot is copied. */
+/* prepare before replacing subscriptions; failure preserves prior joins;
+ * reconcile new aggregate snapshot after expiry/withdrawal to prune joins */
 int nanoamt_native_reconcile(nanoamt_native *native, const nanoamt_memberships *aggregate);
 int nanoamt_native_authorize(void *context, const nanoamt_endpoint *peer, const nanoamt_memberships *requested,
                              const nanoamt_memberships *aggregate);
 int nanoamt_native_receive(nanoamt_native *native, nanoamt_native_packet *packet);
-/* Suitable for relay_posix_config.mtu_feedback. Quote is borrowed; raw ICMP
- * sockets open lazily. Feedback is globally rate-limited with caller time. */
+/* suitable for relay_posix_config.mtu_feedback; raw ICMP sockets open lazily */
 void nanoamt_native_mtu_feedback(void *context, int64_t now_ms, const uint8_t *ip, size_t size, uint32_t mtu);
 void nanoamt_native_get_stats(const nanoamt_native *native, nanoamt_native_stats *stats);
 

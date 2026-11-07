@@ -27,7 +27,7 @@ static void forward(nanoamt_relay *r, int64_t now, const uint8_t *p, size_t n) {
     if (out.kind == NANOAMT_RELAY_DATA)
       CHECK(nanoamt_relay_output_valid(r, now, &out, bytes, out.size));
   }
-  CHECK(0); /* Bounded clients and packet sizes must bound each fanout. */
+  CHECK(0); /* bounded clients and packet sizes must bound each fanout */
 }
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (size > 65535)

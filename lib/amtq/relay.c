@@ -103,6 +103,7 @@ void nanoamtq_relay_free(nanoamtq_relay *r) {
     nanoamt_memberships_free(r->requested);
     nanoamt_memberships_free(r->authorized);
     nanoamt_memberships_free(r->pending);
+    free(r->control.bytes);
     free(r);
   }
 }
@@ -173,13 +174,15 @@ static int copy_bounded(nanoamtq_relay *r, const nanoamt_memberships *state, nan
   if (!copy)
     return NANOAMTQ_ERROR_MEMORY;
   int rc = nanoamt_memberships_tick(copy, r->now);
-  nanoamt_memberships *empty = NULL;
   if (!rc) {
-    empty = nanoamt_memberships_new(&r->config.memberships, r->now);
-    rc = empty ? nanoamt_memberships_union(empty, copy, output) : NANOAMT_RELAY_ERROR_MEMORY;
+    *output = nanoamt_memberships_new(&r->config.memberships, r->now);
+    rc = *output ? nanoamt_memberships_merge(*output, copy) : NANOAMT_RELAY_ERROR_MEMORY;
+    if (rc) {
+      nanoamt_memberships_free(*output);
+      *output = NULL;
+    }
   }
   nanoamt_memberships_free(copy);
-  nanoamt_memberships_free(empty);
   return local_result(rc);
 }
 int nanoamtq_relay_prepare_authorization(nanoamtq_relay *r, int64_t now, uint64_t generation,
@@ -226,7 +229,7 @@ int nanoamtq_relay_commit_authorization(nanoamtq_relay *r, int64_t now, nanoamtq
   int rc = nanoamtq_relay_tick(r, now);
   if (rc)
     return rc;
-  /* Only timestamp changes occur here; endpoint states have no timer expiry. */
+  /* only timestamp changes occur here; endpoint states have no timer expiry */
   nanoamt_memberships_tick(token->authorized, now);
   if (r->pending) {
     nanoamt_memberships_free(r->requested);
@@ -284,7 +287,7 @@ static int valid_record_kinds(const ip_packet *ip) {
   if (n < 8)
     return 0;
   if (p[0] != 0x22 && p[0] != 143)
-    return 1; /* The shared parser validates legacy message kinds. */
+    return 1; /* shared parser validates legacy message kinds */
   size_t at = 8;
   for (unsigned i = 0; i < read16(p + 6); ++i) {
     if (n - at < 4 + stride || p[at] < 1 || p[at] > 6)
@@ -381,6 +384,8 @@ int nanoamtq_relay_receive_control(nanoamtq_relay *r, int64_t now, uint64_t stre
   if (r->pending)
     return NANOAMTQ_MEMBERSHIP;
   rc = amtq_control_feed(&r->control, p, n, consumed, receive_record, r);
+  if (rc == NANOAMTQ_ERROR_MEMORY)
+    return fail(r, rc, NANOAMTQ_CLOSE_INTERNAL);
   if (rc < 0 && !r->error)
     return protocol(r, NANOAMTQ_CLOSE_PROTOCOL);
   if (r->control.size && *consumed)
@@ -561,10 +566,12 @@ int nanoamtq_relay_datagram_next(nanoamtq_relay *r, int64_t now, nanoamtq_relay_
   size_t total = f->size + 2;
   if (f->offset == total)
     return NANOAMTQ_OK;
-  ip_packet ip;
+  ip_packet ip = {0};
+  if (f->ip && f->size >= 20 && (f->ip[0] >> 4 == 4 || (f->ip[0] >> 4 == 6 && f->size >= 40)))
+    ip_header_view(f->ip, f->size, &ip);
   relay_context *c = find_context(r, f->context_id);
-  if (!c || c->mode != NANOAMTQ_MODE_DATAGRAM || c->state != CONTEXT_ACTIVE ||
-      !nanoamt_ip_forward_decode(f->ip, f->size, &ip) || !data_allowed(r, ip.version, ip.source, ip.destination)) {
+  if (!c || c->mode != NANOAMTQ_MODE_DATAGRAM || c->state != CONTEXT_ACTIVE || !ip.version ||
+      !data_allowed(r, ip.version, ip.source, ip.destination)) {
     f->offset = total;
     return NANOAMTQ_IGNORED;
   }
@@ -736,7 +743,7 @@ int nanoamtq_relay_reliable_abort(nanoamtq_relay *r, int64_t now, uint64_t id, u
   if (rc)
     return rc;
   relay_context *c = find_context(r, id);
-  /* FIN acceptance does not immunize a live QUIC stream against STOP_SENDING. */
+  /* FIN acceptance does not immunize a live QUIC stream against STOP_SENDING */
   if (!c || c->mode != NANOAMTQ_MODE_RELIABLE || !block || block > c->last_block)
     return NANOAMTQ_ERROR_ARGUMENT;
   return protocol(r, NANOAMTQ_CLOSE_CONTEXT);

@@ -36,23 +36,19 @@ typedef struct nanoamt_membership_filter {
   size_t source_count;
 } nanoamt_membership_filter;
 
-/* Single-threaded objects. Monotonic nonnegative caller clock, below INT64_MAX.
- * apply validates a complete encapsulated IGMP/MLD report before committing.
- * Malformed reports return IGNORED; resource errors leave the object unchanged.
- * Endpoint transactions enforce state limits on the final result, reserving
- * temporary scratch bounded by the wire report size. Record limits are hard.
- * Router mode implements RFC 3376/3810 timers without generating queries,
- * as permitted for AMT. Endpoint mode has no autonomous expiry.
- */
+/* single-threaded objects; monotonic nonnegative caller clock below INT64_MAX.
+ * apply validates a complete encapsulated IGMP/MLD report before committing;
+ * malformed reports return IGNORED, resource errors leave the object unchanged.
+ * router mode implements RFC 3376/3810 timers without generating queries;
+ * endpoint mode has no autonomous expiry. */
 nanoamt_memberships *nanoamt_memberships_new(const nanoamt_membership_config *config, int64_t now_ms);
 void nanoamt_memberships_free(nanoamt_memberships *state);
 nanoamt_memberships *nanoamt_memberships_clone(const nanoamt_memberships *state);
 int nanoamt_memberships_apply(nanoamt_memberships *state, int64_t now_ms, const uint8_t *ip, size_t size,
                               unsigned ip_version);
-/* Capacity-constrained admission: a valid report commits a bounded subset,
- * continuing withdrawals even if additions exceed state limits. *limited is
- * set when reception was denied. Structural/report bounds remain hard limits;
- * malformed reports still commit nothing. */
+/* capacity-constrained admission: valid reports commit a bounded subset and
+ * continue withdrawals even if additions exceed limits; sets *limited when
+ * reception was denied; malformed reports commit nothing */
 int nanoamt_memberships_apply_limited(nanoamt_memberships *state, int64_t now_ms, const uint8_t *ip, size_t size,
                                       unsigned ip_version, int *limited);
 int nanoamt_memberships_tick(nanoamt_memberships *state, int64_t now_ms);
@@ -60,16 +56,12 @@ int64_t nanoamt_memberships_next_timeout(const nanoamt_memberships *state);
 int nanoamt_memberships_allows(const nanoamt_memberships *state, unsigned ip_version, const uint8_t *group,
                                const uint8_t *source);
 size_t nanoamt_memberships_count(const nanoamt_memberships *state);
-/* Canonical filter at the last tick/apply time. sources is an array of 16-byte
- * addresses (zero padded for IPv4); required count is returned on BUFFER too.
- * No pointers into the object escape, so callers may retain the snapshot.
- */
+/* canonical filter at last tick/apply time; sources is an array of 16-byte
+ * addresses (zero-padded for IPv4); required count is set on BUFFER too */
 int nanoamt_memberships_get(const nanoamt_memberships *state, size_t index, nanoamt_membership_filter *filter,
                             uint8_t (*sources)[16], size_t capacity);
-/* Packet-set algebra. Output has endpoint semantics and bounds from a.
- * Both inputs should first be ticked to the same caller-clock instant.
- * On error *output is NULL. An empty intersection is an empty state.
- */
+/* packet-set algebra; output has endpoint semantics and bounds from a;
+ * tick both inputs to the same clock instant first; on error *output is NULL */
 int nanoamt_memberships_union(const nanoamt_memberships *a, const nanoamt_memberships *b, nanoamt_memberships **output);
 int nanoamt_memberships_intersection(const nanoamt_memberships *a, const nanoamt_memberships *b,
                                      nanoamt_memberships **output);

@@ -16,7 +16,7 @@ size_t nanoamt_general_query(uint8_t *ip, unsigned version, const uint8_t *sourc
     ip[39] = 1;
     memcpy(ip + 40, (uint8_t[]){58, 0, 5, 2, 0, 0, 1, 0}, 8);
     q[0] = 130;
-    /* Round upward to the representable MLD maximum response code. */
+    /* round upward to the representable MLD maximum response code */
     unsigned code = response_ms;
     if (code >= 32768) {
       code = 0x8000;

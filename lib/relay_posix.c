@@ -240,7 +240,7 @@ static int relay_source_credit(nanoamt_relay_posix *io, const nanoamt_endpoint *
     slot->at = now;
     slot->credit = (uint64_t)io->config.source_burst * 1000;
   }
-  /* Saturation is practically unreachable; keep the table bounded even then. */
+  /* keep LRU serial bounded even on saturation */
   if (io->source_serial != UINT64_MAX)
     ++io->source_serial;
   slot->used = io->source_serial;
@@ -249,9 +249,7 @@ static int relay_source_credit(nanoamt_relay_posix *io, const nanoamt_endpoint *
 
 static int relay_drain_errors(nanoamt_relay_posix *io) {
 #ifdef __linux__
-  /* Error payloads identify earlier datagrams, but accepting one at sendmsg
-   * did not promise delivery. Drain bounded work even with no queued output,
-   * so unreachable peers cannot leave the shared listener stuck at POLLERR. */
+  /* drain socket error queue so unreachable peers do not leave POLLERR set */
   for (unsigned i = 0; i < 32; ++i) {
     uint8_t byte;
     struct iovec vec = {&byte, 1};
@@ -385,7 +383,7 @@ int nanoamt_relay_posix_forward(nanoamt_relay_posix *io, int64_t now, const uint
   return NANOAMT_OK;
 }
 
-/* 1: accepted, 0: retry EAGAIN, -1: permanent datagram failure. */
+/* 1: accepted, 0: retry EAGAIN, -1: permanent datagram failure */
 static int relay_send_packet(nanoamt_relay_posix *io, const nanoamt_endpoint *source,
                              const nanoamt_endpoint *destination, const uint8_t *bytes, size_t size, uint8_t tos) {
 #ifndef __linux__
@@ -449,8 +447,7 @@ static int relay_send_packet(nanoamt_relay_posix *io, const nanoamt_endpoint *so
   return 1;
 #endif
 }
-/* Consult the kernel's route cache after EMSGSIZE. A connected probe carries
- * no application traffic and does not change the shared listener's peer. */
+/* query route cache PMTU after EMSGSIZE using a connected probe socket */
 static int relay_reduce_mtu(nanoamt_relay_posix *io, const nanoamt_relay_output *out) {
 #ifdef __linux__
   int v6 = ip_version(out->destination.ip_version) == 6;
@@ -464,10 +461,7 @@ static int relay_reduce_mtu(nanoamt_relay_posix *io, const nanoamt_relay_output 
   socklen_t peer_size = relay_sockaddr(&out->destination, &peer);
   int mtu = 0;
   socklen_t size = sizeof(mtu);
-  /* Binding an address alone can select a different route on a multihomed
-   * host. Match the packet-info interface used by relay_send_packet. These
-   * Linux options take the interface index in network byte order and do not
-   * require the privileges needed by SO_BINDTODEVICE. */
+  /* match egress interface index from packet info without SO_BINDTODEVICE */
   uint32_t ifindex = htonl(source.scope_id);
   int rc = (source.scope_id && setsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_UNICAST_IF : IP_UNICAST_IF,
                                           &ifindex, sizeof(ifindex))) ||
@@ -556,8 +550,7 @@ int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
       if (rc > 0)
         sent = 1;
       else if (errno == EMSGSIZE && relay_reduce_mtu(io, &io->pending)) {
-        /* This datagram was not submitted. Reframe only this destination at
-         * the reduced budget, preserving completed fanout and input age. */
+        /* reframe only this destination at the reduced PMTU budget */
         work->cursor = io->before_pending;
         work->cursor.feedback_done = 0;
       }

@@ -23,21 +23,16 @@ typedef struct nanoamt_relay_config {
   uint32_t minimum_path_mtu;   /* 0: 576 (IPv6 always at least 1280) */
   int (*random_bytes)(void *context, void *bytes, size_t size);
   void *random_context;
-  /* Cryptographic keyed hash truncated to 6 bytes. Both key and input are
-   * private/borrowed for the call; never retain them. Nonzero means failure. */
+  /* keyed hash truncated to 6 bytes; key and input are borrowed for the call */
   int (*response_mac)(void *context, const uint8_t key[32], const uint8_t *input, size_t size, uint8_t mac[6]);
   void *mac_context;
-  /* Install the proposed aggregate upstream state before returning zero.
-   * Failure must leave previous native subscriptions usable. NULL accepts
-   * all state for callers supplying multicast packets directly. No reentry.
-   * Failed additions retain only previously authorized, still-requested
-   * reception; requested state and withdrawals always commit. */
+  /* install proposed aggregate upstream state before returning zero; failure
+   * preserves prior subscriptions; NULL accepts all state; no reentry */
   int (*authorize)(void *context, const nanoamt_endpoint *peer, const nanoamt_memberships *requested,
                    const nanoamt_memberships *aggregate);
   void *authorize_context;
-  /* Explicit workaround for Linux AMT gateway flag-bit bugs. 0: RFC wire;
-   * 4/6: only that inner family, legacy Request P bit, no optional Query
-   * gateway-address trailer. Use a separate listener for the other family. */
+  /* workaround for Linux AMT gateway flag bugs; 0: RFC wire, 4/6: legacy P bit
+   * and no optional query gateway-address trailer for that inner family */
   unsigned linux_gateway_family;
 } nanoamt_relay_config;
 
@@ -55,9 +50,8 @@ typedef struct nanoamt_relay_output {
   uint32_t mtu; /* FEEDBACK: inner MTU, destination is the multicast source */
   uint8_t kind, tos, dont_fragment;
 } nanoamt_relay_output;
-/* Caller-owned fanout cursor. Fields are private. The input packet must stay
- * immutable and alive until next returns OK. Free/reset a cursor to drop the
- * remaining fanout; the relay retains no packet or unbounded output queue. */
+/* caller-owned fanout cursor; input packet must stay immutable and alive until
+ * next returns OK; reset/drop cursor to discard remaining fanout */
 typedef struct nanoamt_relay_forward {
   const nanoamt_relay *owner;
   const uint8_t *ip;
@@ -68,8 +62,7 @@ typedef struct nanoamt_relay_forward {
   uint8_t feedback_done;
 } nanoamt_relay_forward;
 typedef struct nanoamt_relay_stats {
-  /* data_packets/data_bytes count outputs emitted by the core, before an
-   * adapter submits them. They do not assert socket acceptance or delivery. */
+  /* data_packets and data_bytes count core outputs emitted before socket send */
   uint64_t discoveries, requests, updates, teardowns, bad_mac, malformed;
   uint64_t limited, denied, expired, data_packets, data_bytes, mtu_drops;
   size_t clients, fanout_entries;
@@ -80,8 +73,7 @@ nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now
 void nanoamt_relay_free(nanoamt_relay *relay);
 int nanoamt_relay_tick(nanoamt_relay *relay, int64_t now_ms);
 int64_t nanoamt_relay_next_timeout(const nanoamt_relay *relay);
-/* A returned control packet commits its generation. Retain it across socket
- * EAGAIN; do not overwrite it until sent or intentionally dropped. */
+/* returned control packet commits its generation; retain across socket EAGAIN */
 int nanoamt_relay_receive(nanoamt_relay *relay, int64_t now_ms, const nanoamt_endpoint *peer,
                           const nanoamt_endpoint *local, const uint8_t *bytes, size_t size,
                           nanoamt_relay_control *output);
@@ -90,12 +82,8 @@ int nanoamt_relay_set_path_mtu(nanoamt_relay *relay, int64_t now_ms, const nanoa
                                const nanoamt_endpoint *local, uint32_t mtu);
 int nanoamt_relay_forward_begin(nanoamt_relay *relay, int64_t now_ms, const uint8_t *ip, size_t size,
                                 nanoamt_relay_forward *cursor);
-/* Buffer errors do not advance the cursor. PACKET consumes one output;
- * adapters must retain it across EAGAIN and revalidate eligibility with
- * output_valid before deferred transmission. FEEDBACK returns the quoted
- * original IP packet in bytes; the native adapter emits ICMPv4 code 4 or
- * ICMPv6 Packet Too Big, once at the minimum affected SSM tunnel MTU.
- */
+/* buffer errors do not advance cursor; PACKET consumes one output, revalidate
+ * with output_valid before deferred send; FEEDBACK quotes original IP packet */
 int nanoamt_relay_forward_next(nanoamt_relay *relay, int64_t now_ms, nanoamt_relay_forward *cursor, uint8_t *bytes,
                                size_t capacity, nanoamt_relay_output *output);
 int nanoamt_relay_output_valid(nanoamt_relay *relay, int64_t now_ms, const nanoamt_relay_output *output,

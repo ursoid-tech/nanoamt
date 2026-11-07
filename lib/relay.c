@@ -60,8 +60,7 @@ static size_t index_size(const nanoamt_memberships *state) {
   }
   return count;
 }
-/* Reserve all allocation before the native transaction; rebuild itself cannot
- * fail due to allocation after the corresponding membership commit. */
+/* reserve capacity before native transactions so rebuild cannot fail */
 static int index_reserve(nanoamt_relay *r, size_t needed) {
   if (needed > r->config.max_fanout_entries)
     return NANOAMT_RELAY_ERROR_LIMIT;
@@ -168,7 +167,7 @@ nanoamt_relay *nanoamt_relay_new(const nanoamt_relay_config *config, int64_t now
   if (!c.memberships.last_member_time_ms)
     c.memberships.last_member_time_ms = c.robustness * 1000;
   if (c.secret_interval_ms < c.memberships.membership_interval_ms)
-    return NULL; /* Two key generations must cover all live cookies. */
+    return NULL; /* two key generations must cover all live cookies */
   c.aggregate.mode = NANOAMT_MEMBERSHIP_ENDPOINT;
   if (!c.aggregate.max_groups)
     c.aggregate.max_groups = 1024;
@@ -215,7 +214,7 @@ void nanoamt_relay_free(nanoamt_relay *r) {
     free(r->index_sources);
     free(r->index);
     free(r->buckets);
-    /* Do not leave long-lived cookie keys in a reusable heap block. */
+    /* wipe long-lived cookie keys before freeing */
     wipe(r->secret, sizeof(r->secret));
     wipe(r->previous, sizeof(r->previous));
     free(r);
@@ -359,18 +358,17 @@ static int aggregate(nanoamt_relay *r, const relay_client *replace, const nanoam
       state = candidate;
     if (!state)
       continue;
-    /* Data-path ticks skip non-due clients; algebra needs matching clocks. */
+    /* tick non-due clients so set algebra uses matching clocks */
     if (c && c != replace && c->id)
       nanoamt_memberships_tick(c->authorized, r->now);
-    nanoamt_memberships *merged = NULL;
-    int rc = nanoamt_memberships_union(*output, state, &merged);
+    if (!nanoamt_memberships_count(state))
+      continue;
+    int rc = nanoamt_memberships_merge(*output, state);
     if (rc) {
       nanoamt_memberships_free(*output);
       *output = NULL;
       return rc;
     }
-    nanoamt_memberships_free(*output);
-    *output = merged;
   }
   return NANOAMT_OK;
 }
@@ -419,8 +417,7 @@ static int update(nanoamt_relay *r, const nanoamt_endpoint *peer, const nanoamt_
       relay_client *other = r->clients + i;
       if (!other->id)
         slot = other;
-      else if (ip_version(other->peer.ip_version) == ip_version(peer->ip_version) &&
-               !memcmp(other->peer.ip, peer->ip, ip_address_size(peer->ip_version)))
+      else if (peer_ip_equal(&other->peer, peer))
         ++per_ip;
     }
     if (!slot || per_ip >= r->config.max_clients_per_ip || r->last_id == UINT64_MAX) {
@@ -442,25 +439,23 @@ static int update(nanoamt_relay *r, const nanoamt_endpoint *peer, const nanoamt_
     nanoamt_memberships_free(candidate);
     return rc;
   }
-  /* Allocate both outcomes BEFORE the native authorization transaction. Once
-   * native joins succeed, the protocol commit must not require an allocation. */
+  /* allocate both outcomes before the native authorization transaction */
   nanoamt_membership_config empty_config = r->config.memberships;
   empty_config.mode = NANOAMT_MEMBERSHIP_ENDPOINT;
-  nanoamt_memberships *empty = nanoamt_memberships_new(&empty_config, r->now);
-  rc = empty ? nanoamt_memberships_union(empty, candidate, &authorized) : NANOAMT_RELAY_ERROR_MEMORY;
+  authorized = nanoamt_memberships_new(&empty_config, r->now);
+  rc = authorized ? nanoamt_memberships_merge(authorized, candidate) : NANOAMT_RELAY_ERROR_MEMORY;
   if (!rc && c->id)
     rc = nanoamt_memberships_intersection(c->authorized, candidate, &retained);
   if (rc == NANOAMT_RELAY_ERROR_LIMIT) {
-    /* A bounded representation may not fit the union of EXCLUDE lists.
-     * Deny that reception entirely rather than accidentally grant traffic. */
+    /* deny reception if EXCLUDE list union exceeds representation bounds */
     rc = NANOAMT_OK;
     denied = 1;
   }
-  if (!retained) {
-    retained = empty;
-    empty = NULL;
+  if (!rc && !retained) {
+    retained = nanoamt_memberships_new(&empty_config, r->now);
+    if (!retained)
+      rc = NANOAMT_RELAY_ERROR_MEMORY;
   }
-  nanoamt_memberships_free(empty);
   if (rc) {
     nanoamt_memberships_free(merged);
     nanoamt_memberships_free(authorized);
@@ -549,7 +544,9 @@ int nanoamt_relay_receive(nanoamt_relay *r, int64_t now, const nanoamt_endpoint 
     if (rc)
       return rc;
     for (size_t i = 0; i < r->config.max_clients; ++i)
-      if (r->clients[i].id && endpoint_equal(&r->clients[i].peer, &old))
+      if (r->clients[i].id && ip_version(r->clients[i].peer.ip_version) == old.ip_version &&
+          r->clients[i].peer.port == old.port &&
+          !memcmp(r->clients[i].peer.ip, old.ip, ip_address_size(old.ip_version)))
         delete_client(r, r->clients + i);
     timers(r);
     ++r->stats.teardowns;
@@ -597,8 +594,7 @@ int nanoamt_relay_receive(nanoamt_relay *r, int64_t now, const nanoamt_endpoint 
       memcpy(address + 2, peer->ip, 16);
     out->size = 12 + length + 18;
     if (r->config.linux_gateway_family) {
-      /* Old kernels reject the RFC G flag as reserved. Omitting this
-       * optional trailer is valid RFC wire and leaves cookie binding intact. */
+      /* omit optional RFC G flag trailer for old Linux kernels */
       out->bytes[1] = 0;
       out->size = 12 + length;
     }
@@ -779,12 +775,12 @@ int nanoamt_relay_forward_next(nanoamt_relay *r, int64_t now, nanoamt_relay_forw
   int rc = nanoamt_relay_tick(r, now);
   if (rc)
     return rc;
-  ip_packet ip;
-  if (!nanoamt_ip_forward_decode(f->ip, f->size, &ip))
+  if (!f->ip || f->size < 20 || (f->ip[0] >> 4 != 4 && (f->ip[0] >> 4 != 6 || f->size < 40)))
     return NANOAMT_ERROR_ARGUMENT;
+  ip_packet ip;
+  ip_header_view(f->ip, f->size, &ip);
   if (!f->feedback_done) {
-    /* Recompute at emission: a leave or PMTU change can occur while the
-     * caller retains a cursor or a previous output under backpressure. */
+    /* recompute at emission in case of leave or PMTU change under backpressure */
     f->feedback_mtu = 0;
     for (size_t i = eligible_next(f, f->client, r->config.max_clients); i < r->config.max_clients;
          i = eligible_next(f, i + 1, r->config.max_clients)) {
