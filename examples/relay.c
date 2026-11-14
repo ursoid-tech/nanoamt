@@ -209,19 +209,14 @@ int main(int argc, char **argv) {
     }
     if (fds[0].revents & POLLIN)
       for (unsigned i = 0; i < 64; ++i) {
-        uint64_t received;
-        nanoamt_relay_posix_stats before, after;
-        nanoamt_relay_posix_get_stats(relay, &before);
-        received = before.received;
         rc = nanoamt_relay_posix_receive(relay, now);
-        nanoamt_relay_posix_get_stats(relay, &after);
+        if (rc == NANOAMT_AGAIN)
+          break;
         if (rc < 0) {
           fprintf(stderr, "relay input error %d\n", rc);
           failed = 1;
           break;
         }
-        if (after.received == received)
-          break;
       }
     if (failed)
       break;
@@ -229,7 +224,7 @@ int main(int argc, char **argv) {
       for (unsigned i = 0; i < 64; ++i) {
         nanoamt_native_packet packet;
         rc = nanoamt_native_receive(native, &packet);
-        if (rc == NANOAMT_OK)
+        if (rc == NANOAMT_AGAIN)
           break;
         if (rc < 0) {
           perror("native input");

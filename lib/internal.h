@@ -2,6 +2,7 @@
 #define NANOAMT_INTERNAL_H
 
 #include "nanoamt.h"
+#include <limits.h>
 #include <string.h>
 
 enum message_type {
@@ -23,11 +24,30 @@ typedef struct ip_packet {
 
 struct nanoamt_memberships;
 int nanoamt_memberships_merge(struct nanoamt_memberships *out, const struct nanoamt_memberships *b);
+int nanoamt_memberships_apply_in_place(struct nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size_t size,
+                                       unsigned version, int *limited);
+int nanoamt_memberships_equal(const struct nanoamt_memberships *a, const struct nanoamt_memberships *b);
 typedef struct nanoamt_reassembly nanoamt_reassembly;
 nanoamt_reassembly *nanoamt_reassembly_create(void);
 void nanoamt_reassembly_destroy(nanoamt_reassembly *r);
 int nanoamt_reassemble(nanoamt_reassembly *r, int64_t now, uint8_t **bytes, size_t *size);
 
+static inline int64_t nanoamt_after(int64_t now, uint32_t delay) {
+  return now > INT64_MAX - (int64_t)delay ? INT64_MAX : now + (int64_t)delay;
+}
+static inline uint32_t nanoamt_qqic_value(unsigned code) {
+  return code < 128 ? code : (((code & 15u) | 16u) << (((code >> 4) & 7u) + 3));
+}
+static inline int nanoamt_take_credit(uint64_t *credit, int64_t *at, int64_t now, unsigned rate, unsigned burst) {
+  uint64_t cap = (uint64_t)burst * 1000, room = cap - *credit;
+  uint64_t elapsed = *at < 0 ? 0 : (uint64_t)(now - *at);
+  *credit += elapsed >= (room + rate - 1) / rate ? room : elapsed * rate;
+  *at = now;
+  if (*credit < 1000)
+    return 0;
+  *credit -= 1000;
+  return 1;
+}
 static inline unsigned ip_version(unsigned version) {
   return version ? version : 4;
 }
@@ -48,9 +68,11 @@ static inline void write16(uint8_t *p, uint16_t n) {
   p[0] = (uint8_t)(n >> 8);
   p[1] = (uint8_t)n;
 }
+static inline int ipv6_scoped(const uint8_t *ip) {
+  return (ip[0] == 0xfe && (ip[1] & 0xc0u) == 0x80u) || (ip[0] == 0xff && (ip[1] & 15u) <= 2u);
+}
 static inline int peer_ip_equal(const nanoamt_endpoint *a, const nanoamt_endpoint *b) {
-  int scoped = ip_version(a->ip_version) == 6 &&
-               ((a->ip[0] == 0xfe && (a->ip[1] & 0xc0u) == 0x80u) || (a->ip[0] == 0xff && (a->ip[1] & 15u) <= 2));
+  int scoped = ip_version(a->ip_version) == 6 && ipv6_scoped(a->ip);
   return ip_version(a->ip_version) == ip_version(b->ip_version) && (!scoped || a->scope_id == b->scope_id) &&
          memcmp(a->ip, b->ip, ip_address_size(a->ip_version)) == 0;
 }
@@ -73,6 +95,20 @@ static inline int address_unicast(const uint8_t *p, unsigned version) {
 }
 static inline int multicast(const uint8_t *p, unsigned version) {
   return ip_version(version) == 4 ? (p[0] & 240) == 224 : p[0] == 255;
+}
+static inline int forwardable_group(const uint8_t *group, unsigned version) {
+  unsigned v = ip_version(version);
+  if (!multicast(group, v))
+    return 0;
+  return v == 4 ? !(group[0] == 224 && !group[1] && !group[2]) : (group[1] & 15u) > 2u;
+}
+static inline int forwardable_ip(const ip_packet *ip) {
+  return address_unicast(ip->source, ip->version) && forwardable_group(ip->destination, ip->version) && ip->ttl;
+}
+static inline int ssm_ip(const ip_packet *ip) {
+  return ip->version == 4
+             ? ip->destination[0] == 232
+             : ip->destination[0] == 255 && (ip->destination[1] & 0xf0u) == 0x30u && zero(ip->destination + 2, 2);
 }
 
 uint16_t nanoamt_checksum(const uint8_t *bytes, size_t size, uint32_t sum);

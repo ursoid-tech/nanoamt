@@ -22,7 +22,8 @@ struct nanoamt_native {
   nanoamt_native_config config;
   int fd, icmp4, icmp6, loopback;
   native_filter *filters;
-  size_t count;
+  uint32_t *buckets;
+  size_t count, bucket_count;
   uint8_t input[65575];
   int64_t feedback_at;
   uint64_t feedback_credit;
@@ -129,6 +130,7 @@ void nanoamt_native_close(nanoamt_native *n) {
   if (n->icmp6 >= 0)
     close(n->icmp6);
   native_filters_free(n->filters, n->count);
+  free(n->buckets);
   free(n);
 }
 int nanoamt_native_fd(const nanoamt_native *n) {
@@ -161,30 +163,84 @@ static int native_install(native_filter *filter) {
   }
   return setsockopt(filter->fd, level, MCAST_MSFILTER, request, filter->size);
 }
+static const uint8_t *native_address_bytes(const struct sockaddr_storage *address) {
+  return address->ss_family == AF_INET6 ? (const uint8_t *)&((const struct sockaddr_in6 *)address)->sin6_addr
+                                        : (const uint8_t *)&((const struct sockaddr_in *)address)->sin_addr;
+}
+static size_t native_group_hash(unsigned version, const uint8_t *group) {
+  uint64_t h = UINT64_C(14695981039346656037) ^ version;
+  size_t n = ip_address_size(version);
+  for (size_t i = 0; i < n; ++i)
+    h = (h ^ group[i]) * UINT64_C(1099511628211);
+  return (size_t)(h ^ (h >> 32));
+}
 int nanoamt_native_reconcile(nanoamt_native *n, const nanoamt_memberships *aggregate) {
   if (!n || !aggregate)
     return NANOAMT_ERROR_ARGUMENT;
-  size_t count = nanoamt_memberships_count(aggregate), sources = 0;
-  if (count > n->config.max_groups)
-    return NANOAMT_RELAY_ERROR_LIMIT;
+  size_t raw_count = nanoamt_memberships_count(aggregate), count = 0, sources = 0;
+  int fast_unchanged = 1;
+  for (size_t i = 0; i < raw_count; ++i) {
+    nanoamt_membership_filter f;
+    int rc = nanoamt_memberships_get(aggregate, i, &f, NULL, 0);
+    if (rc != NANOAMT_OK && rc != NANOAMT_RELAY_ERROR_BUFFER) {
+      ++n->stats.failed_transactions;
+      return rc;
+    }
+    if (!forwardable_group(f.group, f.ip_version))
+      continue;
+    if (count == n->config.max_groups || f.source_count > n->config.max_sources - sources) {
+      ++n->stats.failed_transactions;
+      return NANOAMT_RELAY_ERROR_LIMIT;
+    }
+    if (fast_unchanged) {
+      if (count >= n->count || f.source_count > 64)
+        fast_unchanged = 0;
+      else {
+        const struct group_filter *cur = n->filters[count].request;
+        size_t addr_len = ip_address_size(f.ip_version);
+        uint8_t stack_sources[64][16];
+        if ((cur->gf_group.ss_family == AF_INET6 ? 6u : 4u) != f.ip_version ||
+            cur->gf_fmode != (f.exclude ? MCAST_EXCLUDE : MCAST_INCLUDE) || cur->gf_numsrc != f.source_count ||
+            memcmp(native_address_bytes(&cur->gf_group), f.group, addr_len) ||
+            nanoamt_memberships_get(aggregate, i, &f, stack_sources, 64))
+          fast_unchanged = 0;
+        for (size_t j = 0; fast_unchanged && j < f.source_count; ++j)
+          if (memcmp(native_address_bytes(&cur->gf_slist[j]), stack_sources[j], addr_len))
+            fast_unchanged = 0;
+      }
+    }
+    ++count;
+    sources += f.source_count;
+  }
+  if (fast_unchanged && count == n->count) {
+    n->stats.groups = count;
+    n->stats.sources = sources;
+    return NANOAMT_OK;
+  }
+  size_t bucket_count = count ? 16 : 0;
+  while (bucket_count < count * 2)
+    bucket_count *= 2;
   native_filter *prepared = count ? calloc(count, sizeof(*prepared)) : NULL;
-  if (count && !prepared)
+  uint32_t *buckets = bucket_count ? calloc(bucket_count, sizeof(*buckets)) : NULL;
+  if ((count && !prepared) || (bucket_count && !buckets)) {
+    free(prepared);
+    free(buckets);
+    ++n->stats.failed_transactions;
     return NANOAMT_RELAY_ERROR_MEMORY;
+  }
   for (size_t i = 0; i < count; ++i) {
     prepared[i].fd = -1;
     prepared[i].reuse = -1;
   }
   int rc = NANOAMT_OK;
-  for (size_t i = 0; i < count; ++i) {
+  size_t at = 0;
+  for (size_t i = 0; i < raw_count; ++i) {
     nanoamt_membership_filter f;
     rc = nanoamt_memberships_get(aggregate, i, &f, NULL, 0);
     if (rc != NANOAMT_OK && rc != NANOAMT_RELAY_ERROR_BUFFER)
       goto fail;
-    if (f.source_count > n->config.max_sources - sources) {
-      rc = NANOAMT_RELAY_ERROR_LIMIT;
-      goto fail;
-    }
-    sources += f.source_count;
+    if (!forwardable_group(f.group, f.ip_version))
+      continue;
     uint8_t (*addresses)[16] = f.source_count ? calloc(f.source_count, 16) : NULL;
     if (f.source_count && !addresses) {
       rc = NANOAMT_RELAY_ERROR_MEMORY;
@@ -202,8 +258,8 @@ int nanoamt_native_reconcile(nanoamt_native *n, const nanoamt_memberships *aggre
       rc = NANOAMT_RELAY_ERROR_MEMORY;
       goto fail;
     }
-    prepared[i].request = request;
-    prepared[i].size = (socklen_t)bytes;
+    prepared[at].request = request;
+    prepared[at].size = (socklen_t)bytes;
     request->gf_interface = n->config.interface_index;
     native_address(&request->gf_group, f.group, f.ip_version, request->gf_interface);
     request->gf_fmode = f.exclude ? MCAST_EXCLUDE : MCAST_INCLUDE;
@@ -211,6 +267,10 @@ int nanoamt_native_reconcile(nanoamt_native *n, const nanoamt_memberships *aggre
     for (size_t j = 0; j < f.source_count; ++j)
       native_address(&request->gf_slist[j], addresses[j], f.ip_version, request->gf_interface);
     free(addresses);
+    size_t slot = native_group_hash(f.ip_version, f.group) & (bucket_count - 1);
+    while (buckets[slot])
+      slot = (slot + 1) & (bucket_count - 1);
+    buckets[slot] = (uint32_t)++at;
   }
   int unchanged = count == n->count;
   for (size_t i = 0; unchanged && i < count; ++i)
@@ -235,18 +295,24 @@ int nanoamt_native_reconcile(nanoamt_native *n, const nanoamt_memberships *aggre
         n->filters[prepared[i].reuse].fd = -1;
       }
     native_filters_free(n->filters, n->count);
+    free(n->buckets);
     n->filters = prepared;
+    n->buckets = buckets;
     n->count = count;
+    n->bucket_count = bucket_count;
     prepared = NULL;
+    buckets = NULL;
     ++n->stats.transactions;
   }
   native_filters_free(prepared, count);
+  free(buckets);
   n->stats.groups = count;
   n->stats.sources = sources;
   return NANOAMT_OK;
 fail: {
   int error = errno;
   native_filters_free(prepared, count);
+  free(buckets);
   ++n->stats.failed_transactions;
   errno = error;
   return rc;
@@ -288,14 +354,13 @@ static int native_fix_offload(uint8_t *bytes, size_t size) {
   write16(transport + checksum_at, ip.protocol == 17 && !checksum ? 65535 : checksum);
   return 1;
 }
-static const uint8_t *native_address_bytes(const struct sockaddr_storage *address) {
-  return address->ss_family == AF_INET6 ? (const uint8_t *)&((const struct sockaddr_in6 *)address)->sin6_addr
-                                        : (const uint8_t *)&((const struct sockaddr_in *)address)->sin_addr;
-}
 static int native_allows(const nanoamt_native *n, const ip_packet *ip) {
-  size_t size = ip->version == 6 ? 16 : 4;
-  for (size_t i = 0; i < n->count; ++i) {
-    const struct group_filter *filter = n->filters[i].request;
+  if (!n->bucket_count)
+    return 0;
+  size_t size = ip->version == 6 ? 16 : 4, mask = n->bucket_count - 1;
+  for (size_t slot = native_group_hash(ip->version, ip->destination) & mask; n->buckets[slot];
+       slot = (slot + 1) & mask) {
+    const struct group_filter *filter = n->filters[n->buckets[slot] - 1].request;
     if ((filter->gf_group.ss_family == AF_INET6 ? 6 : 4) != ip->version ||
         memcmp(native_address_bytes(&filter->gf_group), ip->destination, size))
       continue;
@@ -331,7 +396,7 @@ int nanoamt_native_receive(nanoamt_native *n, nanoamt_native_packet *packet) {
     size = recvmsg(n->fd, &msg, 0);
   } while (size < 0 && errno == EINTR);
   if (size < 0)
-    return errno == EAGAIN || errno == EWOULDBLOCK ? NANOAMT_OK : NANOAMT_ERROR_IO;
+    return errno == EAGAIN || errno == EWOULDBLOCK ? NANOAMT_AGAIN : NANOAMT_ERROR_IO;
   ++n->stats.captured;
   if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
     ++n->stats.truncated;
@@ -363,7 +428,7 @@ int nanoamt_native_receive(nanoamt_native *n, nanoamt_native_packet *packet) {
     ++n->stats.malformed;
     return NANOAMT_IGNORED;
   }
-  if (!multicast(ip.destination, ip.version) || !address_unicast(ip.source, ip.version) || !native_allows(n, &ip)) {
+  if (!forwardable_ip(&ip) || !native_allows(n, &ip)) {
     ++n->stats.filtered;
     return NANOAMT_IGNORED;
   }
@@ -387,26 +452,17 @@ void nanoamt_native_mtu_feedback(void *context, int64_t now, const uint8_t *byte
   if (!n || !bytes || now < 0 || now == INT64_MAX || now < n->feedback_at ||
       !nanoamt_ip_forward_decode(bytes, size, &ip) || ip.size != size || !address_unicast(ip.source, ip.version))
     return;
-  int ssm = ip.version == 4
-                ? ip.destination[0] == 232
-                : ip.destination[0] == 255 && (ip.destination[1] & 240u) == 48 && zero(ip.destination + 2, 2);
   int icmp_error = (ip.protocol == 58 && (!ip.payload_size || ip.payload[0] < 128)) ||
                    (ip.protocol == 1 && (!ip.payload_size || ip.payload[0] == 3 || ip.payload[0] == 4 ||
                                          ip.payload[0] == 5 || ip.payload[0] == 11 || ip.payload[0] == 12));
-  if (!ssm || (ip.version == 4 && (mtu < 68 || mtu > 65535 || (read16(bytes + 6) & 0x1fffu))) ||
+  if (!ssm_ip(&ip) || (ip.version == 4 && (mtu < 68 || mtu > 65535 || (read16(bytes + 6) & 0x1fffu))) ||
       (ip.version == 6 && !mtu) || icmp_error)
     return;
-  uint64_t cap = (uint64_t)n->config.feedback_burst * 1000, room = cap - n->feedback_credit;
-  uint64_t elapsed = n->feedback_at < 0 ? 0 : (uint64_t)(now - n->feedback_at);
-  n->feedback_credit += elapsed >= (room + n->config.feedback_rate - 1) / n->config.feedback_rate
-                            ? room
-                            : elapsed * n->config.feedback_rate;
-  n->feedback_at = now;
-  if (n->feedback_credit < 1000) {
+  if (!nanoamt_take_credit(&n->feedback_credit, &n->feedback_at, now, n->config.feedback_rate,
+                           n->config.feedback_burst)) {
     ++n->stats.feedback_limited;
     return;
   }
-  n->feedback_credit -= 1000;
   int v6 = ip.version == 6, *fd = v6 ? &n->icmp6 : &n->icmp4;
   if (*fd < 0)
     *fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);

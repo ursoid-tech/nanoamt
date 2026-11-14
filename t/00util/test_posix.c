@@ -66,7 +66,7 @@ static void exchange(int v6) {
   nanoamt_posix *io = nanoamt_posix_open(&c, 0);
   CHECK(io);
   nanoamt_packet packet;
-  CHECK(nanoamt_posix_receive(io, 0, &packet) == NANOAMT_OK && packet.data == NULL);
+  CHECK(nanoamt_posix_receive(io, 0, &packet) == NANOAMT_AGAIN && packet.data == NULL);
   block_sends = 1;
   CHECK(nanoamt_posix_send(io, 0) == NANOAMT_OK);
   CHECK(nanoamt_posix_wants_write(io));

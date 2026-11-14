@@ -20,7 +20,7 @@ int64_t amtq_frag_deadline(const amtq_reassembly *r) {
   int64_t next = INT64_MAX;
   for (unsigned i = 0; i < r->capacity; ++i) {
     const amtq_fragment_slot *s = &r->slots[i];
-    int64_t at = amtq_after(s->updated, r->timeout);
+    int64_t at = nanoamt_after(s->updated, r->timeout);
     if (s->data && at < next)
       next = at;
   }

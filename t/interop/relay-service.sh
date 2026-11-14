@@ -24,6 +24,7 @@ bind=0.0.0.0
 if [ "$3" = 1 ]; then bind=::; fi
 "$1" --interface native0 --bind "$bind" > /dev/null 2> "$relay_log" &
 relay_pid=$!
+while [ ! -s "$relay_log" ]; do kill -0 "$relay_pid"; sleep .01; done
 if ! "$2" "$3" "$4"; then cat "$relay_log" >&2; exit 1; fi
 kill -TERM "$relay_pid"
 if ! wait "$relay_pid"; then cat "$relay_log" >&2; exit 1; fi

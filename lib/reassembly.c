@@ -19,18 +19,22 @@ typedef struct assembly {
   uint8_t version, protocol, addresses[32], id[4];
   unsigned ecn_seen;
   size_t prefix_size, previous_next, total, received, highest;
-  uint8_t prefix[MAX_PREFIX], body[MAX_BODY], seen[8192];
+  uint8_t prefix[MAX_PREFIX], body[MAX_BODY], seen[1024];
 } assembly;
 
 struct nanoamt_reassembly {
-  assembly slots[SLOTS];
-  uint8_t output[65575];
+  assembly *slots;
+  uint8_t *output;
 };
 
 nanoamt_reassembly *nanoamt_reassembly_create(void) {
   return calloc(1, sizeof(nanoamt_reassembly));
 }
 void nanoamt_reassembly_destroy(nanoamt_reassembly *r) {
+  if (r) {
+    free(r->slots);
+    free(r->output);
+  }
   free(r);
 }
 
@@ -150,6 +154,8 @@ int nanoamt_reassemble(nanoamt_reassembly *r, int64_t now, uint8_t **bytes, size
   if (kind != FRAGMENT_PACKET)
     return kind == WHOLE_PACKET;
   if (!f.offset && !f.more) { /* atomic fragment */
+    if (!r->output && !(r->output = malloc(65575)))
+      return 0;
     memcpy(r->output, *bytes, f.prefix_size);
     memcpy(r->output + f.prefix_size, f.payload, f.length);
     r->output[f.previous_next] = f.protocol;
@@ -161,6 +167,8 @@ int nanoamt_reassemble(nanoamt_reassembly *r, int64_t now, uint8_t **bytes, size
   size_t end = f.offset + f.length;
   if (!f.length || (f.more && (f.length & 7)) || end > MAX_BODY || f.prefix_size > MAX_PREFIX)
     return 0;
+  if ((!r->slots && !(r->slots = calloc(SLOTS, sizeof(*r->slots)))) || (!r->output && !(r->output = malloc(65575))))
+    return 0;
   assembly *slot = get_assembly(r, now, &f);
   if ((slot->final && (end > slot->total || (!f.more && end != slot->total))) || (!f.more && slot->highest > end))
     goto reject;
@@ -168,16 +176,12 @@ int nanoamt_reassemble(nanoamt_reassembly *r, int64_t now, uint8_t **bytes, size
   /* RFC 3168 */
   if ((slot->ecn_seen & 1) && slot->ecn_seen != 1)
     goto reject;
-  size_t first_byte = f.offset / 8, last_byte = end / 8;
-  for (size_t i = first_byte; i < last_byte; ++i)
-    if (slot->seen[i])
+  size_t first_block = f.offset / 8, last_block = (end + 7) / 8;
+  for (size_t b = first_block; b < last_block; ++b)
+    if (slot->seen[b / 8] & (1u << (b & 7)))
       goto reject;
-  unsigned tail_mask = (1u << (end % 8)) - 1;
-  if (tail_mask && (slot->seen[last_byte] & tail_mask))
-    goto reject;
-  memset(slot->seen + first_byte, 255, last_byte - first_byte);
-  if (tail_mask)
-    slot->seen[last_byte] |= (uint8_t)tail_mask;
+  for (size_t b = first_block; b < last_block; ++b)
+    slot->seen[b / 8] |= (uint8_t)(1u << (b & 7));
   memcpy(slot->body + f.offset, f.payload, f.length);
   slot->received += f.length;
   if (end > slot->highest)

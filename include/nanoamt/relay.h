@@ -31,8 +31,8 @@ typedef struct nanoamt_relay_config {
   int (*authorize)(void *context, const nanoamt_endpoint *peer, const nanoamt_memberships *requested,
                    const nanoamt_memberships *aggregate);
   void *authorize_context;
-  /* workaround for Linux AMT gateway flag bugs; 0: RFC wire, 4/6: legacy P bit
-   * and no optional query gateway-address trailer for that inner family */
+  /* workaround for Linux AMT gateway quirks; 0: RFC wire, 4/6: accept both
+   * legacy (0x80) and RFC (0x01) P bits and omit optional query trailer */
   unsigned linux_gateway_family;
 } nanoamt_relay_config;
 
@@ -57,7 +57,6 @@ typedef struct nanoamt_relay_forward {
   const uint8_t *ip;
   size_t size, client, offset;
   uint64_t max_tunnel_id;
-  uint32_t feedback_mtu;
   uint8_t eligible[128];
   uint8_t feedback_done;
 } nanoamt_relay_forward;

@@ -16,13 +16,10 @@ typedef struct member_group {
 struct nanoamt_memberships {
   nanoamt_membership_config config;
   member_group *groups;
-  size_t count, sources;
+  size_t count, group_capacity, sources;
   int64_t now;
 };
 
-static int64_t deadline(int64_t now, uint32_t delay) {
-  return now > INT64_MAX - delay ? INT64_MAX : now + delay;
-}
 static member_group *find_group(const nanoamt_memberships *s, unsigned version, const uint8_t *group) {
   for (size_t i = 0; i < s->count; ++i)
     if (s->groups[i].version == version && !memcmp(s->groups[i].address, group, ip_address_size(version)))
@@ -51,7 +48,7 @@ static int add_source(nanoamt_memberships *s, member_group *g, const uint8_t *ad
     p->until = until;
     return NANOAMT_OK;
   }
-  if (g->count == s->config.max_sources_per_group || s->sources == s->config.max_sources)
+  if (g->count >= s->config.max_sources_per_group || s->sources >= s->config.max_sources)
     return NANOAMT_RELAY_ERROR_LIMIT;
   if (g->count == g->capacity) {
     size_t capacity = g->capacity ? g->capacity * 2 : 4;
@@ -70,17 +67,30 @@ static int add_source(nanoamt_memberships *s, member_group *g, const uint8_t *ad
   ++s->sources;
   return NANOAMT_OK;
 }
-static member_group *add_group(nanoamt_memberships *s, unsigned version, const uint8_t *address) {
+static int add_group(nanoamt_memberships *s, unsigned version, const uint8_t *address, member_group **out) {
   member_group *g = find_group(s, version, address);
-  if (g)
-    return g;
-  if (s->count == s->config.max_groups)
-    return NULL;
+  if (g) {
+    *out = g;
+    return NANOAMT_OK;
+  }
+  if (s->count >= s->config.max_groups)
+    return NANOAMT_RELAY_ERROR_LIMIT;
+  if (s->count == s->group_capacity) {
+    size_t capacity = s->group_capacity ? s->group_capacity * 2 : 4;
+    if (capacity > s->config.max_groups)
+      capacity = s->config.max_groups;
+    g = realloc(s->groups, capacity * sizeof(*g));
+    if (!g)
+      return NANOAMT_RELAY_ERROR_MEMORY;
+    s->groups = g;
+    s->group_capacity = capacity;
+  }
   g = s->groups + s->count++;
   memset(g, 0, sizeof(*g));
   g->version = (uint8_t)version;
   memcpy(g->address, address, ip_address_size(version));
-  return g;
+  *out = g;
+  return NANOAMT_OK;
 }
 
 nanoamt_memberships *nanoamt_memberships_new(const nanoamt_membership_config *config, int64_t now) {
@@ -110,11 +120,6 @@ nanoamt_memberships *nanoamt_memberships_new(const nanoamt_membership_config *co
   nanoamt_memberships *s = calloc(1, sizeof(*s));
   if (!s)
     return NULL;
-  s->groups = calloc(c.max_groups, sizeof(*s->groups));
-  if (!s->groups) {
-    free(s);
-    return NULL;
-  }
   s->config = c;
   s->now = now;
   return s;
@@ -133,6 +138,14 @@ nanoamt_memberships *nanoamt_memberships_clone(const nanoamt_memberships *s) {
   nanoamt_memberships *copy = nanoamt_memberships_new(&s->config, s->now);
   if (!copy)
     return NULL;
+  if (s->count) {
+    copy->groups = calloc(s->count, sizeof(*copy->groups));
+    if (!copy->groups) {
+      nanoamt_memberships_free(copy);
+      return NULL;
+    }
+    copy->group_capacity = s->count;
+  }
   for (size_t i = 0; i < s->count; ++i) {
     member_group *g = copy->groups + i;
     *g = s->groups[i];
@@ -245,8 +258,8 @@ static void shorten(int64_t *timer, int64_t until) {
 }
 static int apply_router(nanoamt_memberships *s, member_group *g, unsigned type, const uint8_t *list, size_t count) {
   size_t stride = ip_address_size(g->version);
-  int64_t gmi = deadline(s->now, s->config.membership_interval_ms);
-  int64_t lmqt = deadline(s->now, s->config.last_member_time_ms);
+  int64_t gmi = nanoamt_after(s->now, s->config.membership_interval_ms);
+  int64_t lmqt = nanoamt_after(s->now, s->config.last_member_time_ms);
   if (g->legacy_until > s->now) {
     if (type == 6)
       return NANOAMT_OK;
@@ -319,10 +332,13 @@ static int apply_record(nanoamt_memberships *s, unsigned version, const uint8_t 
   member_group *g = find_group(s, version, group);
   if (!g && !count && (type == 1 || type == 3 || type == 5 || type == 6))
     return NANOAMT_OK;
-  if (!g && !(g = add_group(s, version, group)))
-    return NANOAMT_RELAY_ERROR_LIMIT;
+  if (!g) {
+    int rc = add_group(s, version, group, &g);
+    if (rc)
+      return rc;
+  }
   if (legacy && type == 2)
-    g->legacy_until = deadline(s->now, s->config.membership_interval_ms);
+    g->legacy_until = nanoamt_after(s->now, s->config.membership_interval_ms);
   int rc = s->config.mode == NANOAMT_MEMBERSHIP_ENDPOINT ? apply_endpoint(s, g, type, list, count)
                                                          : apply_router(s, g, type, list, count);
   if (!rc && !g->exclude && !g->count)
@@ -336,7 +352,7 @@ static void restrict_record(nanoamt_memberships *s, unsigned version, const uint
     return; /* no room for a new group */
   size_t stride = ip_address_size(version);
   int router = s->config.mode == NANOAMT_MEMBERSHIP_ROUTER;
-  int64_t lmqt = deadline(s->now, s->config.last_member_time_ms);
+  int64_t lmqt = nanoamt_after(s->now, s->config.last_member_time_ms);
   if (router && g->legacy_until > s->now) {
     if (type == 6)
       return;
@@ -361,7 +377,7 @@ static void restrict_record(nanoamt_memberships *s, unsigned version, const uint
         if (p->until <= s->now)
           continue;
         if (listed(list, count, stride, p->address))
-          p->until = deadline(s->now, s->config.membership_interval_ms);
+          p->until = nanoamt_after(s->now, s->config.membership_interval_ms);
         else if (type == 3)
           shorten(&p->until, lmqt);
       }
@@ -487,6 +503,60 @@ static int parse_report(nanoamt_memberships *s, const uint8_t *bytes, size_t siz
   }
   return at == n ? NANOAMT_OK : NANOAMT_IGNORED;
 }
+int nanoamt_memberships_apply_in_place(nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size_t size,
+                                       unsigned version, int *limited) {
+  if (!s || (!bytes && size) || now < s->now || now == INT64_MAX || (version != 4 && version != 6))
+    return NANOAMT_ERROR_ARGUMENT;
+  nanoamt_membership_config saved = s->config;
+  int endpoint_transaction = !limited && s->config.mode == NANOAMT_MEMBERSHIP_ENDPOINT;
+  if (endpoint_transaction) {
+    size_t wire = size < 65575 ? size : 65575;
+    size_t extra = wire / 8;
+    if (extra > s->config.max_report_records)
+      extra = s->config.max_report_records;
+    s->config.max_groups += (unsigned)extra;
+    s->config.max_sources += (unsigned)(wire / ip_address_size(version));
+    s->config.max_sources_per_group += (unsigned)(wire / ip_address_size(version));
+  }
+  nanoamt_memberships_tick(s, now);
+  int denied = 0;
+  int rc = parse_report(s, bytes, size, version, limited ? &denied : NULL);
+  s->config = saved;
+  if (!rc && endpoint_transaction) {
+    if (s->count > s->config.max_groups || s->sources > s->config.max_sources)
+      rc = NANOAMT_RELAY_ERROR_LIMIT;
+    for (size_t i = 0; !rc && i < s->count; ++i) {
+      member_group *g = s->groups + i;
+      if (g->count > s->config.max_sources_per_group)
+        rc = NANOAMT_RELAY_ERROR_LIMIT;
+      else if (g->capacity > s->config.max_sources_per_group) {
+        member_source *storage = NULL;
+        if (g->count && !(storage = realloc(g->sources, g->count * sizeof(*storage))))
+          rc = NANOAMT_RELAY_ERROR_MEMORY;
+        else {
+          if (!g->count)
+            free(g->sources);
+          g->sources = storage;
+          g->capacity = g->count;
+        }
+      }
+    }
+    if (!rc && s->group_capacity > s->config.max_groups) {
+      member_group *storage = NULL;
+      if (s->count && !(storage = realloc(s->groups, s->count * sizeof(*storage))))
+        rc = NANOAMT_RELAY_ERROR_MEMORY;
+      else {
+        if (!s->count)
+          free(s->groups);
+        s->groups = storage;
+        s->group_capacity = s->count;
+      }
+    }
+  }
+  if (limited)
+    *limited = !rc && denied;
+  return rc;
+}
 static int apply(nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size_t size, unsigned version,
                  int *limited) {
   if (!s || (!bytes && size) || now < s->now || now == INT64_MAX || (version != 4 && version != 6))
@@ -494,64 +564,13 @@ static int apply(nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size
   nanoamt_memberships *candidate = nanoamt_memberships_clone(s);
   if (!candidate)
     return NANOAMT_RELAY_ERROR_MEMORY;
-  int endpoint_transaction = !limited && s->config.mode == NANOAMT_MEMBERSHIP_ENDPOINT;
-  if (endpoint_transaction) {
-    size_t wire = size < 65575 ? size : 65575;
-    size_t extra = wire / 8;
-    if (extra > s->config.max_report_records)
-      extra = s->config.max_report_records;
-    unsigned groups = s->config.max_groups + (unsigned)extra;
-    member_group *storage = realloc(candidate->groups, (size_t)groups * sizeof(*storage));
-    if (!storage) {
-      nanoamt_memberships_free(candidate);
-      return NANOAMT_RELAY_ERROR_MEMORY;
-    }
-    candidate->groups = storage;
-    candidate->config.max_groups = groups;
-    candidate->config.max_sources += (unsigned)(wire / ip_address_size(version));
-    candidate->config.max_sources_per_group += (unsigned)(wire / ip_address_size(version));
-  }
-  nanoamt_memberships_tick(candidate, now);
-  int denied = 0;
-  int rc = parse_report(candidate, bytes, size, version, limited ? &denied : NULL);
-  if (!rc && endpoint_transaction) {
-    if (candidate->count > s->config.max_groups || candidate->sources > s->config.max_sources)
-      rc = NANOAMT_RELAY_ERROR_LIMIT;
-    for (size_t i = 0; !rc && i < candidate->count; ++i)
-      if (candidate->groups[i].count > s->config.max_sources_per_group)
-        rc = NANOAMT_RELAY_ERROR_LIMIT;
-    /* shrink scratch capacity before committing */
-    for (size_t i = 0; !rc && i < candidate->count; ++i) {
-      member_group *g = candidate->groups + i;
-      if (!g->count) {
-        free(g->sources);
-        g->sources = NULL;
-      } else if (g->capacity != g->count) {
-        member_source *storage = realloc(g->sources, g->count * sizeof(*storage));
-        if (!storage)
-          rc = NANOAMT_RELAY_ERROR_MEMORY;
-        else
-          g->sources = storage;
-      }
-      g->capacity = g->count;
-    }
-    if (!rc) {
-      member_group *storage = realloc(candidate->groups, (size_t)s->config.max_groups * sizeof(*storage));
-      if (!storage)
-        rc = NANOAMT_RELAY_ERROR_MEMORY;
-      else
-        candidate->groups = storage;
-    }
-    candidate->config = s->config;
-  }
+  int rc = nanoamt_memberships_apply_in_place(candidate, now, bytes, size, version, limited);
   if (!rc) {
     nanoamt_memberships old = *s;
     *s = *candidate;
     *candidate = old;
   }
   nanoamt_memberships_free(candidate);
-  if (limited)
-    *limited = !rc && denied;
   return rc;
 }
 int nanoamt_memberships_apply(nanoamt_memberships *s, int64_t now, const uint8_t *bytes, size_t size,
@@ -598,9 +617,10 @@ static int combine_group(nanoamt_memberships *out, const nanoamt_memberships *a,
   const member_group *base = ga ? ga : gb;
   if (intersect && (!ga || !gb))
     return NANOAMT_OK;
-  member_group *g = add_group(out, base->version, base->address);
-  if (!g)
-    return NANOAMT_RELAY_ERROR_LIMIT;
+  member_group *g = NULL;
+  int rc = add_group(out, base->version, base->address, &g);
+  if (rc)
+    return rc;
   int ea = ga && ga->exclude, eb = gb && gb->exclude;
   g->exclude = (uint8_t)(intersect ? ea && eb : ea || eb);
   g->until = INT64_MAX;
@@ -688,6 +708,28 @@ int nanoamt_memberships_union(const nanoamt_memberships *a, const nanoamt_member
 int nanoamt_memberships_intersection(const nanoamt_memberships *a, const nanoamt_memberships *b,
                                      nanoamt_memberships **out) {
   return combine(a, b, 1, out);
+}
+int nanoamt_memberships_equal(const nanoamt_memberships *a, const nanoamt_memberships *b) {
+  if (!a || !b || a->count != b->count)
+    return 0;
+  for (size_t i = 0; i < a->count; ++i) {
+    const member_group *ga = a->groups + i, *gb = find_group(b, ga->version, ga->address);
+    if (!gb || ga->exclude != gb->exclude)
+      return 0;
+    size_t ca = 0, cb = 0;
+    for (size_t j = 0; j < ga->count; ++j)
+      if (canonical_source(a, ga, ga->sources + j)) {
+        if (!canonical_has(b, gb, ga->sources[j].address))
+          return 0;
+        ++ca;
+      }
+    for (size_t j = 0; j < gb->count; ++j)
+      if (canonical_source(b, gb, gb->sources + j))
+        ++cb;
+    if (ca != cb)
+      return 0;
+  }
+  return 1;
 }
 int nanoamt_memberships_subset(const nanoamt_memberships *a, const nanoamt_memberships *b) {
   if (!a || !b || a->now != b->now)

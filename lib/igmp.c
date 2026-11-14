@@ -52,7 +52,7 @@ size_t nanoamt_general_query(uint8_t *ip, unsigned version, const uint8_t *sourc
     unsigned units = (response_ms + 99u) / 100u, code = units;
     if (units >= 128) {
       code = 128;
-      while (code < 255 && (((code & 15u) | 16u) << (((code >> 4) & 7u) + 3)) < units)
+      while (code < 255 && nanoamt_qqic_value(code) < units)
         ++code;
     }
     q[1] = (uint8_t)code;
@@ -83,10 +83,8 @@ int nanoamt_query_decode(uint8_t *bytes, size_t size, unsigned version, uint32_t
       return 0;
     offset = 24;
   }
-  uint32_t qqic = q[offset + 1];
-  if (qqic >= 128)
-    qqic = ((qqic & 15) | 16) << (((qqic >> 4) & 7) + 3);
-  *interval_ms = (qqic ? qqic : 125) * 1000;
+  uint32_t qqic = nanoamt_qqic_value(q[offset + 1]);
+  *interval_ms = (qqic ? qqic : 125u) * 1000u;
   *robustness = (q[offset] & 7) ? (q[offset] & 7) : 2;
   return 1;
 }

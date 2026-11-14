@@ -277,6 +277,16 @@ static void packets(void) {
   put16(last + 8, 1);
   ip_checksum(last + 2);
   CHECK(raw_data(g, 3, 0, last, 27, &packet) == NANOAMTQ_IGNORED);
+  /* wrong-version fragments are dropped before occupying IP reassembly slots */
+  uint8_t wrong_v6[64] = {6, 0, 0x60};
+  put16(wrong_v6 + 6, 16);
+  wrong_v6[8] = 44;
+  wrong_v6[42] = 17;
+  put16(wrong_v6 + 44, 1);
+  for (unsigned k = 0; k < 8; ++k) {
+    wrong_v6[49] = (uint8_t)(k + 1);
+    CHECK(raw_data(g, 3, 0, wrong_v6, 58, &packet) == NANOAMTQ_IGNORED);
+  }
   CHECK(raw_data(g, 3, 0, first, 30, &packet) == NANOAMTQ_PACKET);
   CHECK(packet.size == 5 && !memcmp(packet.data, good + 30, 5));
   CHECK(raw_data(g, 4, 0, last, 27, &packet) == NANOAMTQ_IGNORED);
@@ -421,6 +431,15 @@ static void limits(void) {
   negotiate(g);
   CHECK(nanoamtq_send(g, 1, &out) == NANOAMTQ_PACKET);
   CHECK(nanoamtq_send(g, 10001, &out) == NANOAMTQ_ERROR_TIMEOUT);
+  nanoamtq_free(g);
+  g = create(&c, 0, 0);
+  ready(g, &c);
+  CHECK(nanoamtq_receive_control(g, 2, 0, (uint8_t[]){0x40}, 1, 0) == 0);
+  CHECK(nanoamtq_next_timeout(g) == 10002);
+  CHECK(nanoamtq_receive_control(g, 5000, 0, (uint8_t[]){0x10}, 1, 0) == 0);
+  CHECK(nanoamtq_next_timeout(g) == 10002);
+  CHECK(nanoamtq_send(g, 10002, &out) == NANOAMTQ_ERROR_TIMEOUT);
+  CHECK(nanoamtq_close_error(g) == 0);
   nanoamtq_free(g);
   c.random_bytes = broken_random;
   g = create(&c, 0, 0);

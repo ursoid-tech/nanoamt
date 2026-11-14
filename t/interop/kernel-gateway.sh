@@ -42,6 +42,7 @@ ip route add 232.0.0.0/8 dev native0
 ip -6 route add ff00::/8 dev native0
 "$relay" --linux-gateway-family "$inner" --query-source6 fe80::1 --interface native0 --bind 198.51.100.1 >"$work/relay.log" 2>&1 &
 relay_pid=$!
+while [ ! -s "$work/relay.log" ]; do kill -0 "$relay_pid"; sleep .01; done
 rcv ip link add amtg type amt mode gateway local 198.51.100.2 discovery 198.51.100.1 dev receiver0 relay_port 2268 gateway_port 2268
 rcv ip address add 192.0.2.200/24 dev amtg
 rcv ip -6 address add 2001:db8::c8/64 dev amtg nodad

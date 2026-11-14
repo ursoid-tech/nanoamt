@@ -38,7 +38,4 @@ void amtq_frag_expire(amtq_reassembly *r, int64_t now);
 void amtq_frag_discard(amtq_reassembly *r, uint64_t context);
 int64_t amtq_frag_deadline(const amtq_reassembly *r);
 int amtq_frag_push(amtq_reassembly *r, int64_t now, const nanoamtq_datagram *d, uint8_t *output);
-static inline int64_t amtq_after(int64_t now, uint32_t delay) {
-  return now > INT64_MAX - delay ? INT64_MAX : now + delay;
-}
 #endif

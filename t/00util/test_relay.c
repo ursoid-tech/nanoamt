@@ -163,6 +163,12 @@ static void linux_gateway(void) {
     request.bytes[1] ^= 0x80;
     CHECK(nanoamt_relay_receive(r, 0, &peer, &config.discovery, request.bytes, request.size, &reply) ==
           NANOAMT_IGNORED);
+    request.bytes[1] = 0x81;
+    CHECK(nanoamt_relay_receive(r, 0, &peer, &config.discovery, request.bytes, request.size, &reply) ==
+          NANOAMT_IGNORED);
+    request.bytes[1] = 0x01;
+    CHECK(nanoamt_relay_receive(r, 0, &peer, &config.discovery, request.bytes, request.size, &reply) ==
+          (family == 6 ? NANOAMT_PACKET : NANOAMT_IGNORED));
     /* An authenticated cookie for one inner family never authorizes the other. */
     nanoamt_relay *standard = new_relay(&random, 0);
     nanoamt_config other = fixture_dual_config(&random, 0, family != 6, 0);
@@ -273,13 +279,32 @@ static void authentication(void) {
   CHECK(!stats.clients && stats.teardowns == 1);
   nanoamt_free(g);
   nanoamt_config ll_config = fixture_dual_config(&random, 1, 1, 0);
+  nanoamt_config ll_other = ll_config;
+  ll_config.discovery.scope_id = 3;
+  ll_other.discovery.scope_id = 4;
   nanoamt_endpoint ll_peer = {.ip = {0xfe, 0x80, [15] = 2}, .port = 40002, .ip_version = 6, .scope_id = 3};
+  nanoamt_endpoint ll_peer_other = ll_peer;
+  ll_peer_other.scope_id = 4;
+  nanoamt_datagram other_report;
   g = join(r, &ll_config, &ll_peer, 1, &report);
+  /* scoped cookies and teardowns must stay isolated per interface */
+  CHECK(nanoamt_relay_receive(r, 1, &ll_peer_other, &ll_other.discovery, report.bytes, report.size, &control) ==
+        NANOAMT_IGNORED);
+  nanoamt *g_other = join(r, &ll_other, &ll_peer_other, 1, &other_report);
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(stats.clients == 2 && stats.bad_mac == 12);
   CHECK(!nanoamt_leave(g, 1));
   CHECK(nanoamt_send(g, 1, &report) == NANOAMT_PACKET);
   CHECK(!nanoamt_relay_receive(r, 1, &ll_peer, &ll_config.discovery, report.bytes, report.size, &control));
   nanoamt_relay_get_stats(r, &stats);
-  CHECK(!stats.clients && stats.teardowns == 2);
+  CHECK(stats.clients == 1 && stats.teardowns == 2);
+  CHECK(!nanoamt_leave(g_other, 1));
+  CHECK(nanoamt_send(g_other, 1, &other_report) == NANOAMT_PACKET);
+  CHECK(!nanoamt_relay_receive(r, 1, &ll_peer_other, &ll_other.discovery, other_report.bytes, other_report.size,
+                               &control));
+  nanoamt_relay_get_stats(r, &stats);
+  CHECK(!stats.clients && stats.teardowns == 3);
+  nanoamt_free(g_other);
   nanoamt_free(g);
   nanoamt_relay_free(r);
   /* Cookie from the prior secret survives rotation for the overlap. */
@@ -605,15 +630,24 @@ static void indexed_scale(void) {
   CHECK(before.clients == 1024 && before.fanout_entries == 1024 && before.fanout_rebuilds == 1);
   for (unsigned i = 1; i <= 200; ++i)
     CHECK(destinations(r, i, &target, ports) == 2);
+  /* unchanged refreshes and existing-client requests neither dirty the index nor set L */
+  nanoamt_relay_control control;
+  const uint8_t req_bytes[8] = {3, 0, 0, 0, 9, 8, 7, 6};
+  CHECK(nanoamt_relay_receive(r, 200, peers + 1006, &target.discovery, req_bytes, 8, &control) == NANOAMT_PACKET);
+  CHECK(!(control.bytes[1] & 2u));
+  nanoamt_endpoint extra_peer = peer_for(&target, 55000);
+  CHECK(nanoamt_relay_receive(r, 200, &extra_peer, &target.discovery, req_bytes, 8, &control) == NANOAMT_PACKET);
+  CHECK(control.bytes[1] & 2u);
+  CHECK(!nanoamt_relay_receive(r, 200, peers + 1023, &target.discovery, report.bytes, report.size, &control));
+  CHECK(destinations(r, 200, &target, ports) == 2);
   nanoamt_relay_get_stats(r, &after);
   CHECK(after.fanout_rebuilds == before.fanout_rebuilds && after.timer_scans == before.timer_scans);
-  CHECK(after.fanout_candidates - before.fanout_candidates < 200 * 32);
+  CHECK(after.fanout_candidates - before.fanout_candidates < 201 * 32);
   /* Filter churn changes only the next indexed snapshot, never resurrecting a queued output. */
   uint8_t ip[128], bytes[128];
   size_t n = data(ip, &target, 5);
   nanoamt_relay_forward cursor;
   nanoamt_relay_output out;
-  nanoamt_relay_control control;
   CHECK(!nanoamt_relay_forward_begin(r, 201, ip, n, &cursor));
   CHECK(nanoamt_relay_forward_next(r, 201, &cursor, bytes, sizeof(bytes), &out) == NANOAMT_PACKET);
   unsigned departed = (unsigned)out.destination.port - 40000;
@@ -689,6 +723,25 @@ static void indexed_churn(void) {
   CHECK(stats.fanout_entries == 2);
   for (unsigned i = 0; i < 3; ++i)
     nanoamt_free(g[i]);
+  nanoamt_relay_free(r);
+  /* per-IP client limit also advertises L=1 only to new endpoints on that IP */
+  nanoamt_relay_config per_ip_cfg = {0};
+  per_ip_cfg.random_bytes = fixture_random;
+  per_ip_cfg.random_context = &random;
+  per_ip_cfg.response_mac = test_mac;
+  per_ip_cfg.max_clients = 4;
+  per_ip_cfg.max_clients_per_ip = 1;
+  r = nanoamt_relay_new(&per_ip_cfg, 0);
+  CHECK(r);
+  g[0] = join(r, c, peers, 0, reports);
+  const uint8_t req[8] = {3, 0, 0, 0, 1, 2, 3, 4};
+  CHECK(nanoamt_relay_receive(r, 0, peers, &c[0].discovery, req, 8, &out) == NANOAMT_PACKET && !(out.bytes[1] & 2u));
+  CHECK(nanoamt_relay_receive(r, 0, peers + 1, &c[0].discovery, req, 8, &out) == NANOAMT_PACKET && (out.bytes[1] & 2u));
+  nanoamt_endpoint other_ip = peers[1];
+  other_ip.ip[3] = 88;
+  CHECK(nanoamt_relay_receive(r, 0, &other_ip, &c[0].discovery, req, 8, &out) == NANOAMT_PACKET &&
+        !(out.bytes[1] & 2u));
+  nanoamt_free(g[0]);
   nanoamt_relay_free(r);
 }
 

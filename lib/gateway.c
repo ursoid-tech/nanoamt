@@ -20,10 +20,6 @@ struct nanoamt {
   int joined, error;
 };
 
-static int64_t after(int64_t now, uint32_t delay) {
-  return now > INT64_MAX - delay ? INT64_MAX : now + delay;
-}
-
 static int advance_time(nanoamt *g, int64_t now) {
   if (now < g->last_now || now == INT64_MAX)
     return 0;
@@ -165,7 +161,7 @@ int nanoamt_send(nanoamt *g, int64_t now, nanoamt_datagram *out) {
     if (random_delay(g, 1, 1000, &delay) < 0)
       return fail(g, NANOAMT_ERROR_RANDOM);
     --g->repeats;
-    g->deadline = after(now, delay);
+    g->deadline = nanoamt_after(now, delay);
     if (g->session.has_endpoint)
       return emit_teardown(&g->session, out);
     return emit_report(g, out, REPORT_LEAVE);
@@ -175,7 +171,7 @@ int nanoamt_send(nanoamt *g, int64_t now, nanoamt_datagram *out) {
       if (random_delay(g, 1, 1000, &delay) < 0)
         return fail(g, NANOAMT_ERROR_RANDOM);
       g->repeats = g->robustness;
-      g->report_at = after(now, delay);
+      g->report_at = nanoamt_after(now, delay);
     }
     g->session = g->query;
     g->joined = 1;
@@ -187,7 +183,7 @@ int nanoamt_send(nanoamt *g, int64_t now, nanoamt_datagram *out) {
       if (random_delay(g, 1, 1000, &delay) < 0)
         return fail(g, NANOAMT_ERROR_RANDOM);
       --g->repeats;
-      g->report_at = after(now, delay);
+      g->report_at = nanoamt_after(now, delay);
       return emit_report(g, out, REPORT_JOIN);
     }
     g->state = NANOAMT_STATE_REQUESTING;
@@ -231,7 +227,7 @@ int nanoamt_send(nanoamt *g, int64_t now, nanoamt_datagram *out) {
     out->bytes[1] |= 2;
   memcpy(out->bytes + 4, g->nonce, 4);
   ++g->attempts;
-  g->deadline = after(now, delay);
+  g->deadline = nanoamt_after(now, delay);
   return NANOAMT_PACKET;
 }
 
@@ -278,7 +274,7 @@ int nanoamt_receive_ecn(nanoamt *g, int64_t now, const nanoamt_endpoint *sender,
       if (g->discoveries >= g->config.max_discoveries)
         return fail(g, NANOAMT_ERROR_TIMEOUT);
       discover(g, now);
-      g->deadline = after(now, 1000);
+      g->deadline = nanoamt_after(now, 1000);
       return NANOAMT_OK;
     }
     memset(&g->query, 0, sizeof(g->query));
@@ -292,7 +288,7 @@ int nanoamt_receive_ecn(nanoamt *g, int64_t now, const nanoamt_endpoint *sender,
     g->discoveries = 0;
     if (interval > g->config.refresh_cap_ms)
       interval = g->config.refresh_cap_ms;
-    g->refresh_at = after(now, interval);
+    g->refresh_at = nanoamt_after(now, interval);
     g->deadline = now;
     g->state = NANOAMT_STATE_REPORTING;
     return NANOAMT_OK;

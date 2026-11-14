@@ -596,6 +596,8 @@ static void timeout(void) {
   size_t consumed;
   CHECK(!nanoamtq_relay_receive_control(r, 0, 0, (uint8_t[]){0x40}, 1, 0, &consumed));
   CHECK(consumed == 1 && nanoamtq_relay_next_timeout(r) == 10000);
+  CHECK(!nanoamtq_relay_receive_control(r, 5000, 0, (uint8_t[]){0x10}, 1, 0, &consumed));
+  CHECK(consumed == 1 && nanoamtq_relay_next_timeout(r) == 10000);
   CHECK(nanoamtq_relay_tick(r, 10000) == NANOAMTQ_ERROR_TIMEOUT);
   nanoamtq_relay_free(r);
   pair p;

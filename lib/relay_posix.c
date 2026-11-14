@@ -5,6 +5,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#ifdef __linux__
+#include <linux/errqueue.h>
+#endif
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -14,7 +17,7 @@ typedef struct queued_control {
 } queued_control;
 typedef struct queued_input {
   uint8_t *bytes;
-  size_t size;
+  size_t size, capacity;
   int64_t at;
   nanoamt_relay_forward cursor;
 } queued_input;
@@ -210,24 +213,12 @@ nanoamt_relay *nanoamt_relay_posix_core(nanoamt_relay_posix *io) {
   return io ? io->relay : NULL;
 }
 
-static int relay_take_credit(uint64_t *credit, int64_t *at, int64_t now, unsigned rate, unsigned burst) {
-  uint64_t cap = (uint64_t)burst * 1000;
-  uint64_t elapsed = (uint64_t)(now - *at), room = cap - *credit;
-  *credit += elapsed >= (room + rate - 1) / rate ? room : elapsed * rate;
-  *at = now;
-  if (*credit < 1000)
-    return 0;
-  *credit -= 1000;
-  return 1;
-}
 static int relay_source_credit(nanoamt_relay_posix *io, const nanoamt_endpoint *peer, int64_t now) {
   source_bucket *slot = &io->sources[0];
   int found = 0;
   for (size_t i = 0; i < 64; ++i) {
     source_bucket *bucket = &io->sources[i];
-    if (bucket->used && ip_version(bucket->peer.ip_version) == ip_version(peer->ip_version) &&
-        bucket->peer.scope_id == peer->scope_id &&
-        !memcmp(bucket->peer.ip, peer->ip, ip_address_size(peer->ip_version))) {
+    if (bucket->used && peer_ip_equal(&bucket->peer, peer)) {
       slot = bucket;
       found = 1;
       break;
@@ -244,18 +235,29 @@ static int relay_source_credit(nanoamt_relay_posix *io, const nanoamt_endpoint *
   if (io->source_serial != UINT64_MAX)
     ++io->source_serial;
   slot->used = io->source_serial;
-  return relay_take_credit(&slot->credit, &slot->at, now, io->config.source_rate, io->config.source_burst);
+  return nanoamt_take_credit(&slot->credit, &slot->at, now, io->config.source_rate, io->config.source_burst);
 }
 
 static int relay_drain_errors(nanoamt_relay_posix *io) {
 #ifdef __linux__
   /* drain socket error queue so unreachable peers do not leave POLLERR set */
+  unsigned drained = 0;
   for (unsigned i = 0; i < 32; ++i) {
     uint8_t byte;
+    struct sockaddr_storage peer_addr = {0};
     struct iovec vec = {&byte, 1};
+    union {
+      struct cmsghdr align;
+      uint8_t bytes[CMSG_SPACE(sizeof(struct sock_extended_err) + sizeof(struct sockaddr_in6)) +
+                    CMSG_SPACE(sizeof(struct in6_pktinfo))];
+    } ancillary;
     struct msghdr msg = {0};
+    msg.msg_name = &peer_addr;
+    msg.msg_namelen = sizeof(peer_addr);
     msg.msg_iov = &vec;
     msg.msg_iovlen = 1;
+    msg.msg_control = ancillary.bytes;
+    msg.msg_controllen = sizeof(ancillary.bytes);
     ssize_t n;
     do {
       n = recvmsg(io->fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
@@ -265,12 +267,48 @@ static int relay_drain_errors(nanoamt_relay_posix *io) {
         break;
       return NANOAMT_ERROR_IO;
     }
+    ++drained;
     ++io->stats.send_errors;
+    uint32_t mtu = 0;
+    nanoamt_endpoint local = io->bound;
+    int have_local = !zero(local.ip, ip_address_size(local.ip_version));
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&msg); h; h = CMSG_NXTHDR(&msg, h)) {
+      if (((h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_RECVERR) ||
+           (h->cmsg_level == IPPROTO_IPV6 && h->cmsg_type == IPV6_RECVERR)) &&
+          h->cmsg_len >= CMSG_LEN(sizeof(struct sock_extended_err))) {
+        struct sock_extended_err ee;
+        memcpy(&ee, CMSG_DATA(h), sizeof(ee));
+        if (ee.ee_errno == EMSGSIZE)
+          mtu = ee.ee_info;
+      } else if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_PKTINFO &&
+                 h->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+        struct in_pktinfo info;
+        memcpy(&info, CMSG_DATA(h), sizeof(info));
+        memcpy(local.ip, zero((const uint8_t *)&info.ipi_addr, 4) ? &info.ipi_spec_dst : &info.ipi_addr, 4);
+        local.scope_id = (uint32_t)info.ipi_ifindex;
+        have_local = 1;
+      } else if (h->cmsg_level == IPPROTO_IPV6 && h->cmsg_type == IPV6_PKTINFO &&
+                 h->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+        struct in6_pktinfo info;
+        memcpy(&info, CMSG_DATA(h), sizeof(info));
+        memcpy(local.ip, &info.ipi6_addr, 16);
+        local.scope_id = info.ipi6_ifindex;
+        have_local = 1;
+      }
+    }
+    if (mtu && have_local && (peer_addr.ss_family == AF_INET || peer_addr.ss_family == AF_INET6)) {
+      nanoamt_endpoint peer;
+      relay_endpoint(&peer_addr, &peer);
+      if (nanoamt_relay_set_path_mtu(io->relay, io->now, &peer, &local, mtu) == NANOAMT_OK)
+        ++io->stats.path_mtu_updates;
+    }
   }
-  int error = 0;
-  socklen_t size = sizeof(error);
-  if (getsockopt(io->fd, SOL_SOCKET, SO_ERROR, &error, &size))
-    return NANOAMT_ERROR_IO;
+  if (drained) {
+    int error = 0;
+    socklen_t size = sizeof(error);
+    if (getsockopt(io->fd, SOL_SOCKET, SO_ERROR, &error, &size))
+      return NANOAMT_ERROR_IO;
+  }
 #else
   (void)io;
 #endif
@@ -305,7 +343,7 @@ int nanoamt_relay_posix_receive(nanoamt_relay_posix *io, int64_t now) {
     n = recvmsg(io->fd, &msg, 0);
   } while (n < 0 && errno == EINTR);
   if (n < 0)
-    return errno == EAGAIN || errno == EWOULDBLOCK ? NANOAMT_OK : NANOAMT_ERROR_IO;
+    return errno == EAGAIN || errno == EWOULDBLOCK ? NANOAMT_AGAIN : NANOAMT_ERROR_IO;
   ++io->stats.received;
   if ((msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || (address.ss_family != AF_INET && address.ss_family != AF_INET6)) {
     ++io->stats.truncated;
@@ -313,8 +351,8 @@ int nanoamt_relay_posix_receive(nanoamt_relay_posix *io, int64_t now) {
   }
   nanoamt_endpoint peer, local = io->bound;
   relay_endpoint(&address, &peer);
-  if (!relay_take_credit(&io->rate_credit, &io->rate_at, now, io->config.control_rate, io->config.control_burst) ||
-      !relay_source_credit(io, &peer, now)) {
+  if (!relay_source_credit(io, &peer, now) ||
+      !nanoamt_take_credit(&io->rate_credit, &io->rate_at, now, io->config.control_rate, io->config.control_burst)) {
     ++io->stats.rate_limited;
     return NANOAMT_IGNORED;
   }
@@ -366,16 +404,17 @@ int nanoamt_relay_posix_forward(nanoamt_relay_posix *io, int64_t now, const uint
     return NANOAMT_RELAY_ERROR_LIMIT;
   }
   queued_input *work = &io->inputs[(io->input_head + io->input_count) % io->config.input_capacity];
-  work->bytes = malloc(size);
-  if (!work->bytes)
-    return NANOAMT_RELAY_ERROR_MEMORY;
+  if (size > work->capacity) {
+    uint8_t *storage = realloc(work->bytes, size);
+    if (!storage)
+      return NANOAMT_RELAY_ERROR_MEMORY;
+    work->bytes = storage;
+    work->capacity = size;
+  }
   memcpy(work->bytes, ip, size);
   rc = nanoamt_relay_forward_begin(io->relay, now, work->bytes, size, &work->cursor);
-  if (rc) {
-    free(work->bytes);
-    work->bytes = NULL;
+  if (rc)
     return rc;
-  }
   work->size = size;
   work->at = now;
   ++io->input_count;
@@ -463,6 +502,10 @@ static int relay_reduce_mtu(nanoamt_relay_posix *io, const nanoamt_relay_output 
   socklen_t size = sizeof(mtu);
   /* match egress interface index from packet info without SO_BINDTODEVICE */
   uint32_t ifindex = htonl(source.scope_id);
+#ifdef IP_BIND_ADDRESS_NO_PORT
+  int no_port = 1;
+  (void)setsockopt(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &no_port, sizeof(no_port));
+#endif
   int rc = (source.scope_id && setsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_UNICAST_IF : IP_UNICAST_IF,
                                           &ifindex, sizeof(ifindex))) ||
            bind(fd, (struct sockaddr *)&local, local_size) || connect(fd, (struct sockaddr *)&peer, peer_size) ||
@@ -482,8 +525,9 @@ static int relay_reduce_mtu(nanoamt_relay_posix *io, const nanoamt_relay_output 
 static void relay_drop_input(nanoamt_relay_posix *io) {
   queued_input *work = &io->inputs[io->input_head];
   io->input_bytes -= work->size;
-  free(work->bytes);
-  memset(work, 0, sizeof(*work));
+  work->size = 0;
+  work->at = 0;
+  memset(&work->cursor, 0, sizeof(work->cursor));
   io->input_head = (io->input_head + 1) % io->config.input_capacity;
   --io->input_count;
   memset(&io->pending, 0, sizeof(io->pending));
@@ -520,6 +564,7 @@ int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
       relay_drop_input(io);
       continue;
     }
+    int fresh = 0;
     if (!io->pending.size) {
       io->before_pending = work->cursor;
       rc = nanoamt_relay_forward_next(io->relay, now, &work->cursor, io->output, sizeof(io->output), &io->pending);
@@ -536,8 +581,9 @@ int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
         memset(&io->pending, 0, sizeof(io->pending));
         continue;
       }
+      fresh = 1;
     }
-    rc = nanoamt_relay_output_valid(io->relay, now, &io->pending, io->output, io->pending.size);
+    rc = fresh ? 1 : nanoamt_relay_output_valid(io->relay, now, &io->pending, io->output, io->pending.size);
     if (rc < 0)
       return rc;
     if (!rc)
@@ -562,17 +608,14 @@ int nanoamt_relay_posix_send(nanoamt_relay_posix *io, int64_t now) {
 int nanoamt_relay_posix_wants_write(const nanoamt_relay_posix *io) {
   return io && (io->control_count || io->input_count);
 }
-static int64_t relay_deadline(int64_t at, uint32_t age) {
-  return at > INT64_MAX - age ? INT64_MAX : at + age;
-}
 int64_t nanoamt_relay_posix_next_timeout(const nanoamt_relay_posix *io) {
   if (!io)
     return INT64_MAX;
   int64_t next = nanoamt_relay_next_timeout(io->relay), deadline;
   if (io->control_count &&
-      (deadline = relay_deadline(io->controls[io->control_head].at, io->config.control_age_ms)) < next)
+      (deadline = nanoamt_after(io->controls[io->control_head].at, io->config.control_age_ms)) < next)
     next = deadline;
-  if (io->input_count && (deadline = relay_deadline(io->inputs[io->input_head].at, io->config.data_age_ms)) < next)
+  if (io->input_count && (deadline = nanoamt_after(io->inputs[io->input_head].at, io->config.data_age_ms)) < next)
     next = deadline;
   return next;
 }

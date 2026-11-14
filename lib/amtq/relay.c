@@ -18,7 +18,7 @@ struct nanoamtq_relay {
   nanoamt_memberships *requested, *authorized, *pending;
   uint64_t generation, revision, last_context, close_error;
   unsigned peer_modes, preferred_mode;
-  int error, local_settings, peer_settings, query_pending, awaiting_update, have_nonce, have_context;
+  int error, local_settings, peer_settings, query_pending, have_nonce, have_context;
   uint8_t ip_version, qqic, request_nonce[4], query_nonce[4];
   int64_t now, deadline, partial_deadline;
   relay_context contexts[NANOAMTQ_MAX_CONTEXTS];
@@ -43,9 +43,6 @@ static int local_result(int rc) {
   if (rc == NANOAMT_RELAY_ERROR_LIMIT)
     return NANOAMTQ_ERROR_LIMIT;
   return rc ? NANOAMTQ_ERROR_ARGUMENT : NANOAMTQ_OK;
-}
-static unsigned qqic_value(unsigned code) {
-  return code < 128 ? code : ((code & 15u) | 16u) << (((code >> 4) & 7u) + 3);
 }
 static relay_context *find_context(const nanoamtq_relay *r, uint64_t id) {
   for (unsigned i = 0; i < r->config.max_contexts; ++i)
@@ -78,9 +75,9 @@ nanoamtq_relay *nanoamtq_relay_new(const nanoamtq_relay_config *config, int64_t 
       (!zero(c.query_source6, 16) && !address_unicast(c.query_source6, 6)))
     return NULL;
   unsigned code = 1, seconds = (c.query_interval_ms + 999u) / 1000u;
-  while (code < 255 && qqic_value(code) < seconds)
+  while (code < 255 && nanoamt_qqic_value(code) < seconds)
     ++code;
-  c.query_interval_ms = qqic_value(code) * 1000u;
+  c.query_interval_ms = nanoamt_qqic_value(code) * 1000u;
   c.memberships.mode = NANOAMT_MEMBERSHIP_ENDPOINT;
   nanoamtq_relay *r = calloc(1, sizeof(*r));
   if (!r)
@@ -88,7 +85,7 @@ nanoamtq_relay *nanoamtq_relay_new(const nanoamtq_relay_config *config, int64_t 
   r->config = c;
   r->qqic = (uint8_t)code;
   r->now = now;
-  r->deadline = amtq_after(now, c.control_timeout_ms);
+  r->deadline = nanoamt_after(now, c.control_timeout_ms);
   r->partial_deadline = INT64_MAX;
   r->requested = nanoamt_memberships_new(&c.memberships, now);
   r->authorized = nanoamt_memberships_new(&c.memberships, now);
@@ -170,6 +167,10 @@ int nanoamtq_relay_pending(const nanoamtq_relay *r) {
 }
 static int copy_bounded(nanoamtq_relay *r, const nanoamt_memberships *state, nanoamt_memberships **output) {
   *output = NULL;
+  if (state == r->requested || state == r->pending || state == r->authorized) {
+    *output = nanoamt_memberships_clone(state);
+    return *output ? NANOAMTQ_OK : NANOAMTQ_ERROR_MEMORY;
+  }
   nanoamt_memberships *copy = nanoamt_memberships_clone(state);
   if (!copy)
     return NANOAMTQ_ERROR_MEMORY;
@@ -301,6 +302,7 @@ static int valid_record_kinds(const ip_packet *ip) {
 }
 static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
   nanoamtq_relay *r = context;
+  r->partial_deadline = INT64_MAX;
   if (type == NANOAMTQ_SETTINGS) {
     if (r->peer_settings)
       return protocol(r, NANOAMTQ_CLOSE_SETTINGS);
@@ -341,9 +343,8 @@ static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
       return protocol(r, NANOAMTQ_CLOSE_AMT_MESSAGE);
     r->ip_version = (uint8_t)version;
     r->query_pending = 1;
-    r->awaiting_update = 0;
     memcpy(r->request_nonce, p + 4, 4);
-    r->deadline = amtq_after(r->now, r->config.control_timeout_ms);
+    r->deadline = nanoamt_after(r->now, r->config.control_timeout_ms);
     return NANOAMTQ_OK;
   }
   ip_packet ip;
@@ -356,7 +357,7 @@ static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
   nanoamt_memberships *candidate = nanoamt_memberships_clone(r->requested);
   if (!candidate)
     return fail(r, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
-  int rc = nanoamt_memberships_apply(candidate, r->now, p + 12, n - 12, r->ip_version);
+  int rc = nanoamt_memberships_apply_in_place(candidate, r->now, p + 12, n - 12, r->ip_version, NULL);
   if (rc) {
     nanoamt_memberships_free(candidate);
     if (rc == NANOAMT_RELAY_ERROR_MEMORY)
@@ -365,8 +366,7 @@ static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
   }
   r->pending = candidate;
   ++r->generation;
-  r->awaiting_update = 0;
-  r->deadline = amtq_after(r->now, r->config.control_timeout_ms);
+  r->deadline = nanoamt_after(r->now, r->config.control_timeout_ms);
   return NANOAMTQ_MEMBERSHIP;
 }
 int nanoamtq_relay_receive_control(nanoamtq_relay *r, int64_t now, uint64_t stream, const uint8_t *p, size_t n, int fin,
@@ -388,8 +388,8 @@ int nanoamtq_relay_receive_control(nanoamtq_relay *r, int64_t now, uint64_t stre
     return fail(r, rc, NANOAMTQ_CLOSE_INTERNAL);
   if (rc < 0 && !r->error)
     return protocol(r, NANOAMTQ_CLOSE_PROTOCOL);
-  if (r->control.size && *consumed)
-    r->partial_deadline = amtq_after(now, r->config.control_timeout_ms);
+  if (r->control.size && r->partial_deadline == INT64_MAX)
+    r->partial_deadline = nanoamt_after(now, r->config.control_timeout_ms);
   else if (!r->control.size)
     r->partial_deadline = INT64_MAX;
   return rc;
@@ -434,9 +434,9 @@ int nanoamtq_relay_send(nanoamtq_relay *r, int64_t now, nanoamtq_control *out) {
     rc = emit(r, out, NANOAMTQ_AMT_CONTROL, query, n);
     if (rc == NANOAMTQ_PACKET) {
       r->query_pending = 0;
-      r->awaiting_update = r->have_nonce = 1;
+      r->have_nonce = 1;
       memcpy(r->query_nonce, r->request_nonce, 4);
-      r->deadline = amtq_after(now, r->config.control_timeout_ms);
+      r->deadline = nanoamt_after(now, r->config.control_timeout_ms);
     }
     return rc;
   }
@@ -467,7 +467,7 @@ int nanoamtq_relay_send(nanoamtq_relay *r, int64_t now, nanoamtq_control *out) {
     rc = emit(r, out, NANOAMTQ_CONTEXT, fields, n);
     if (rc == NANOAMTQ_PACKET) {
       opening->state = CONTEXT_PENDING;
-      opening->deadline = amtq_after(now, r->config.control_timeout_ms);
+      opening->deadline = nanoamt_after(now, r->config.control_timeout_ms);
     }
     return rc;
   }
@@ -519,11 +519,6 @@ static int data_allowed(const nanoamtq_relay *r, unsigned version, const uint8_t
          nanoamt_memberships_allows(r->requested, version, group, source) &&
          (!r->pending || nanoamt_memberships_allows(r->pending, version, group, source));
 }
-static int forwardable(const ip_packet *ip) {
-  return address_unicast(ip->source, ip->version) && multicast(ip->destination, ip->version) && ip->ttl &&
-         (ip->version == 4 ? !(ip->destination[0] == 224 && !ip->destination[1] && !ip->destination[2])
-                           : (ip->destination[1] & 15u) > 2);
-}
 int nanoamtq_relay_datagram_begin(nanoamtq_relay *r, int64_t now, uint64_t id, const uint8_t *p, size_t n,
                                   nanoamtq_relay_cursor *cursor) {
   if (!cursor || (!p && n))
@@ -537,7 +532,7 @@ int nanoamtq_relay_datagram_begin(nanoamtq_relay *r, int64_t now, uint64_t id, c
     return NANOAMTQ_ERROR_ARGUMENT;
   ip_packet ip;
   if (c->state != CONTEXT_ACTIVE || n > NANOAMTQ_MAX_DATA_MESSAGE - 2 || !nanoamt_ip_forward_decode(p, n, &ip) ||
-      ip.size != n || !forwardable(&ip) || !data_allowed(r, ip.version, ip.source, ip.destination))
+      ip.size != n || !forwardable_ip(&ip) || !data_allowed(r, ip.version, ip.source, ip.destination))
     return NANOAMTQ_IGNORED;
   cursor->owner = r;
   cursor->ip = p;
@@ -634,7 +629,7 @@ int nanoamtq_relay_datagram_valid(nanoamtq_relay *r, int64_t now, const nanoamtq
     ip_packet ip;
     return d.size == out->total_size && !out->packet_id && !out->offset && d.size >= 3 && d.data[0] == MULTICAST_DATA &&
            !d.data[1] && nanoamt_ip_forward_decode(d.data + 2, d.size - 2, &ip) && ip.size == d.size - 2 &&
-           ip.version == out->ip_version && forwardable(&ip) &&
+           ip.version == out->ip_version && forwardable_ip(&ip) &&
            !memcmp(ip.source, out->source, ip_address_size(ip.version)) &&
            !memcmp(ip.destination, out->group, ip_address_size(ip.version));
   }
@@ -692,7 +687,7 @@ int nanoamtq_relay_reliable_record(nanoamtq_relay *r, int64_t now, uint64_t id, 
     return NANOAMTQ_ERROR_ARGUMENT;
   ip_packet ip;
   if (n > NANOAMTQ_MAX_DATA_MESSAGE - 2 || !nanoamt_ip_forward_decode(ip_bytes, n, &ip) || ip.size != n ||
-      !forwardable(&ip) || !data_allowed(r, ip.version, ip.source, ip.destination))
+      !forwardable_ip(&ip) || !data_allowed(r, ip.version, ip.source, ip.destination))
     return NANOAMTQ_IGNORED;
   out->size = amtq_varint_size(n + 2) + n + 2;
   if (capacity < out->size)
@@ -724,7 +719,7 @@ int nanoamtq_relay_reliable_valid(nanoamtq_relay *r, int64_t now, const nanoamtq
          data_allowed(r, out->ip_version, out->source, out->group) && amtq_get(bytes, size, &at, &n) &&
          n == size - at && n == out->total_size && n >= 3 && bytes[at] == MULTICAST_DATA && !bytes[at + 1] &&
          nanoamt_ip_forward_decode(bytes + at + 2, size - at - 2, &ip) && ip.size == size - at - 2 &&
-         ip.version == out->ip_version && forwardable(&ip) &&
+         ip.version == out->ip_version && forwardable_ip(&ip) &&
          !memcmp(ip.source, out->source, ip_address_size(ip.version)) &&
          !memcmp(ip.destination, out->group, ip_address_size(ip.version));
 }

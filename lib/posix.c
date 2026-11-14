@@ -195,7 +195,7 @@ int nanoamt_posix_receive(nanoamt_posix *io, int64_t now, nanoamt_packet *packet
     n = recvmsg(io->fd, &msg, 0);
   } while (n < 0 && errno == EINTR);
   if (n < 0)
-    return errno == EAGAIN || errno == EWOULDBLOCK ? NANOAMT_OK : NANOAMT_ERROR_IO;
+    return errno == EAGAIN || errno == EWOULDBLOCK ? NANOAMT_AGAIN : NANOAMT_ERROR_IO;
   if ((msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || (from.ss_family != AF_INET && from.ss_family != AF_INET6))
     return NANOAMT_IGNORED;
   nanoamt_endpoint peer = {0};

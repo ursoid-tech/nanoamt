@@ -32,7 +32,7 @@ struct nanoamtq {
   uint64_t close_error;
   int local_settings, peer_settings, requesting, queried, dirty, reported, have_context;
   uint8_t nonce[4];
-  int64_t now, control_deadline, refresh_at;
+  int64_t now, control_deadline, partial_deadline, refresh_at;
   uint64_t last_context;
   unsigned peer_modes;
   reliable_stream streams[NANOAMTQ_MAX_RELIABLE_STREAMS];
@@ -67,16 +67,9 @@ static int advance(nanoamtq *g, int64_t now) {
   for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
     if (g->contexts[i].used && g->contexts[i].closing && now >= g->contexts[i].drain_deadline)
       return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
-  if (now >= g->control_deadline)
+  if (now >= g->control_deadline || now >= g->partial_deadline)
     return fail(g, NANOAMTQ_ERROR_TIMEOUT, 0);
   return NANOAMTQ_OK;
-}
-static int forwardable(const uint8_t *group, unsigned version) {
-  if (!multicast(group, version))
-    return 0;
-  if (version == 4)
-    return group[0] != 224 || group[1] != 0 || group[2] != 0;
-  return (group[1] & 15) > 2;
 }
 nanoamtq *nanoamtq_new(const nanoamtq_config *config, int64_t now) {
   if (!config || !config->random_bytes || now < 0 || now == INT64_MAX ||
@@ -108,8 +101,8 @@ nanoamtq *nanoamtq_new(const nanoamtq_config *config, int64_t now) {
     return NULL;
   }
   g->now = now;
-  g->control_deadline = amtq_after(now, g->config.control_timeout_ms);
-  g->refresh_at = INT64_MAX;
+  g->control_deadline = nanoamt_after(now, g->config.control_timeout_ms);
+  g->partial_deadline = g->refresh_at = INT64_MAX;
   return g;
 }
 void nanoamtq_free(nanoamtq *g) {
@@ -133,7 +126,7 @@ int nanoamtq_set_memberships(nanoamtq *g, const nanoamtq_membership *m, size_t c
   if (g->error)
     return g->error;
   for (size_t i = 0; i < count; ++i)
-    if (!forwardable(m[i].group, g->config.ip_version) || m[i].any_source > 1 ||
+    if (!forwardable_group(m[i].group, g->config.ip_version) || m[i].any_source > 1 ||
         (!m[i].any_source && !address_unicast(m[i].source, g->config.ip_version)))
       return NANOAMTQ_ERROR_ARGUMENT;
   if (count)
@@ -268,7 +261,7 @@ int nanoamtq_send(nanoamtq *g, int64_t now, nanoamtq_control *out) {
     if (rc == NANOAMTQ_PACKET) {
       memcpy(g->nonce, request + 4, 4);
       g->requesting = 1;
-      g->control_deadline = amtq_after(now, g->config.control_timeout_ms);
+      g->control_deadline = nanoamt_after(now, g->config.control_timeout_ms);
     }
     return rc;
   }
@@ -348,7 +341,7 @@ static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
     g->control_deadline = INT64_MAX;
     if (interval > g->config.refresh_cap_ms)
       interval = g->config.refresh_cap_ms;
-    g->refresh_at = amtq_after(g->now, interval);
+    g->refresh_at = nanoamt_after(g->now, interval);
     return NANOAMTQ_OK;
   }
   if (type == NANOAMTQ_CONTEXT_ACK)
@@ -370,7 +363,7 @@ static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
         return protocol(g, NANOAMTQ_CLOSE_CONTEXT);
       c->closing = 1;
       c->final_block = final;
-      c->drain_deadline = amtq_after(g->now, g->config.control_timeout_ms);
+      c->drain_deadline = nanoamt_after(g->now, g->config.control_timeout_ms);
       if (drain_complete(c))
         clear_context(c);
     } else {
@@ -399,7 +392,9 @@ static int handle(nanoamtq *g, uint64_t type, uint8_t *p, size_t n) {
   return protocol(g, NANOAMTQ_CLOSE_EXCESSIVE_LOAD);
 }
 static int receive_record(void *context, uint64_t type, uint8_t *p, size_t n) {
-  return handle(context, type, p, n);
+  nanoamtq *g = context;
+  g->partial_deadline = INT64_MAX;
+  return handle(g, type, p, n);
 }
 int nanoamtq_receive_control(nanoamtq *g, int64_t now, uint64_t stream, const uint8_t *p, size_t n, int fin) {
   if (!p && n)
@@ -415,6 +410,10 @@ int nanoamtq_receive_control(nanoamtq *g, int64_t now, uint64_t stream, const ui
     return fail(g, rc, NANOAMTQ_CLOSE_INTERNAL);
   if (rc && !g->error)
     return protocol(g, NANOAMTQ_CLOSE_PROTOCOL);
+  if (g->control.size && g->partial_deadline == INT64_MAX)
+    g->partial_deadline = nanoamt_after(now, g->config.control_timeout_ms);
+  else if (!g->control.size)
+    g->partial_deadline = INT64_MAX;
   return rc;
 }
 static int match_membership(const nanoamtq_membership *m, const uint8_t *source, const uint8_t *group, size_t addr) {
@@ -425,8 +424,9 @@ static int deliver(nanoamtq *g, int64_t now, size_t size, nanoamt_packet *packet
     return NANOAMTQ_IGNORED;
   uint8_t *ip_bytes = g->message + 2;
   size -= 2;
-  if ((ip_bytes[0] >> 4 == 4 && (size < 20 || read16(ip_bytes + 2) != size)) ||
-      (ip_bytes[0] >> 4 == 6 && (size < 40 || 40u + read16(ip_bytes + 4) != size)))
+  if ((ip_bytes[0] >> 4) != g->config.ip_version ||
+      (g->config.ip_version == 4 && (size < 20 || read16(ip_bytes + 2) != size)) ||
+      (g->config.ip_version == 6 && (size < 40 || 40u + read16(ip_bytes + 4) != size)))
     return NANOAMTQ_IGNORED;
   if (!nanoamt_reassemble(g->ip_fragments, now, &ip_bytes, &size))
     return NANOAMTQ_IGNORED;
@@ -488,7 +488,7 @@ int64_t nanoamtq_next_timeout(const nanoamtq *g) {
     return INT64_MAX;
   if (!g->local_settings)
     return g->now;
-  int64_t next = g->control_deadline;
+  int64_t next = g->control_deadline < g->partial_deadline ? g->control_deadline : g->partial_deadline;
   for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
     if (g->contexts[i].used && g->contexts[i].closing && g->contexts[i].drain_deadline < next)
       next = g->contexts[i].drain_deadline;

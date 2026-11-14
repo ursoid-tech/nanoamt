@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 typedef struct nanoamt_posix nanoamt_posix;
-enum { NANOAMT_ERROR_IO = -4 };
+enum { NANOAMT_AGAIN = 3, NANOAMT_ERROR_IO = -4 };
 
 nanoamt_posix *nanoamt_posix_open(const nanoamt_config *config, int64_t now_ms);
 void nanoamt_posix_close(nanoamt_posix *io);

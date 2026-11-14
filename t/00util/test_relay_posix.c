@@ -118,6 +118,7 @@ static void exchange(int outer6, int inner6) {
   nanoamt_posix *g = nanoamt_posix_open(&c, 0);
   CHECK(g);
   nanoamt_packet packet;
+  CHECK(nanoamt_relay_posix_receive(r, 0) == NANOAMT_AGAIN);
   for (int phase = 0; phase < 2; ++phase) {
     CHECK(nanoamt_posix_send(g, 0) == NANOAMT_PACKET);
     readable(nanoamt_relay_posix_fd(r));
@@ -211,6 +212,7 @@ static void path_mtu(int outer6, int inner6) {
   nanoamt_posix *g = nanoamt_posix_open(&c, 0);
   CHECK(g);
   nanoamt_packet packet;
+  CHECK(nanoamt_relay_posix_receive(r, 0) == NANOAMT_AGAIN);
   for (int phase = 0; phase < 2; ++phase) {
     CHECK(nanoamt_posix_send(g, 0) == NANOAMT_PACKET);
     readable(nanoamt_relay_posix_fd(r));
@@ -264,7 +266,7 @@ static void path_mtu(int outer6, int inner6) {
     do {
       readable(nanoamt_posix_fd(g));
       rc = nanoamt_posix_receive(g, 0, &packet);
-    } while (rc == NANOAMT_OK || rc == NANOAMT_IGNORED);
+    } while (rc == NANOAMT_OK || rc == NANOAMT_IGNORED || rc == NANOAMT_AGAIN);
     CHECK(rc == NANOAMT_PACKET && packet.size == payload);
     for (size_t i = 0; i < payload; ++i)
       CHECK(packet.data[i] == 0xa5);
@@ -281,7 +283,7 @@ static void admission(int per_source) {
   c.control_rate = 1;
   c.control_capacity = 1;
   if (per_source) {
-    c.control_burst = 100;
+    c.control_burst = 3;
     c.source_rate = 1;
     c.source_burst = 2;
   }
@@ -293,15 +295,29 @@ static void admission(int per_source) {
   ep.ip[3] = 1;
   struct sockaddr_storage address;
   socklen_t len = relay_sockaddr(&ep, &address);
-  int fd = socket(AF_INET, SOCK_DGRAM, 0), other = socket(AF_INET, SOCK_DGRAM, 0);
-  CHECK(fd >= 0 && other >= 0);
+  int fd = socket(AF_INET, SOCK_DGRAM, 0), other = socket(AF_INET, SOCK_DGRAM, 0),
+      distinct = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(fd >= 0 && other >= 0 && distinct >= 0);
+  struct sockaddr_in distinct_ip = {.sin_family = AF_INET};
+  CHECK(inet_pton(AF_INET, "127.0.0.2", &distinct_ip.sin_addr) == 1);
+  CHECK(!bind(distinct, (struct sockaddr *)&distinct_ip, sizeof(distinct_ip)));
   uint8_t discovery[] = {1, 0, 0, 0, 0, 0, 0, 1};
   for (int i = 0; i < 3; ++i) {
-    /* Different UDP source ports still share the same source-IP quota. */
+    /* different UDP source ports still share the same source-IP quota */
     int sender = per_source && i == 2 ? other : fd;
     CHECK(sendto(sender, discovery, sizeof(discovery), 0, (struct sockaddr *)&address, len) == sizeof(discovery));
     readable(nanoamt_relay_posix_fd(r));
     CHECK(nanoamt_relay_posix_receive(r, 0) == (i == 0 ? NANOAMT_PACKET : NANOAMT_IGNORED));
+  }
+  if (per_source) {
+    /* source-limited floods must not exhaust global control credit for other peers */
+    uint8_t sink[64];
+    CHECK(nanoamt_relay_posix_send(r, 0) == NANOAMT_PACKET);
+    readable(fd);
+    CHECK(recv(fd, sink, sizeof(sink), 0) > 0);
+    CHECK(sendto(distinct, discovery, sizeof(discovery), 0, (struct sockaddr *)&address, len) == sizeof(discovery));
+    readable(nanoamt_relay_posix_fd(r));
+    CHECK(nanoamt_relay_posix_receive(r, 0) == NANOAMT_PACKET);
   }
   nanoamt_relay_posix_stats stats;
   nanoamt_relay_posix_get_stats(r, &stats);
@@ -315,6 +331,7 @@ static void admission(int per_source) {
   readable(fd);
   close(fd);
   close(other);
+  close(distinct);
   nanoamt_relay_posix_close(r);
 }
 static void asynchronous_error(void) {

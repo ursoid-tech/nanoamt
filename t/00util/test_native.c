@@ -213,11 +213,22 @@ static void network(int v6, const char *interface_name) {
   if (!n)
     perror("native_open");
   CHECK(n);
+  nanoamt_native_packet empty_pkt;
+  CHECK(nanoamt_native_receive(n, &empty_pkt) == NANOAMT_AGAIN);
   nanoamt_memberships *s = state();
   membership(s, &c, REPORT_JOIN);
   CHECK(!nanoamt_native_reconcile(n, s));
   native_filter *old = n->filters;
   CHECK(!nanoamt_native_reconcile(n, s) && n->filters == old); /* no duplicate joins */
+  /* link-local groups are ignored by native reconciliation */
+  nanoamt_config local_group = c;
+  if (v6)
+    CHECK(inet_pton(AF_INET6, "ff02::fb", local_group.group) == 1);
+  else
+    CHECK(inet_pton(AF_INET, "224.0.0.251", local_group.group) == 1);
+  membership(s, &local_group, REPORT_JOIN);
+  CHECK(!nanoamt_native_reconcile(n, s) && n->filters == old && n->count == 1);
+  membership(s, &local_group, REPORT_LEAVE);
   int fd = source_socket(&c, interface);
   nanoamt_config alternate = c;
   CHECK(inet_pton(v6 ? AF_INET6 : AF_INET, v6 ? "2001:db8::b" : "192.0.2.20", alternate.source) == 1);
